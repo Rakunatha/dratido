@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: dratido
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn dratido_app:app
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false                 # secret — set manually in the Render dashboard, not committed
+      - key: ADMIN_EMAIL
+        sync: false                 # optional — bypasses ownership checks for this email
+      - key: PYTHON_VERSION
+        value: 3.11.9
