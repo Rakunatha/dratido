@@ -9,7 +9,5 @@ services:
     envVars:
       - key: GROQ_API_KEY
         sync: false                 # secret — set manually in the Render dashboard, not committed
-      - key: ADMIN_EMAIL
-        sync: false                 # optional — bypasses ownership checks for this email
       - key: PYTHON_VERSION
         value: 3.11.9
