@@ -687,7 +687,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Dratido — Draft Till Done</title>
+<title>Dratido</title>
 <style>
   :root{
     --maroon:#8B1E2D; --maroon-dark:#6e1723; --ink:#1c1a19; --paper:#faf7f2;
