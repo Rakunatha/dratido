@@ -1069,7 +1069,7 @@ async function startConversation(){
     canGenerate = false; hasDraft = false;
     generateBtn.style.display = 'none';
     panelFooter.style.display = 'none';
-    panelBody.innerHTML = '<div class="placeholder">Your draft will appear here once we\\'ve brainstormed enough to generate it.</div>';
+    panelBody.innerHTML = '<div class="placeholder">Your draft will appear here once we\'ve brainstormed enough to generate it.</div>';
     renderMessages(data.messages);
   }
 }
