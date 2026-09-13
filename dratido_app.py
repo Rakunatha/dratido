@@ -21,7 +21,7 @@ Usage:
   python dratido_app.py
 """
 
-import os, re, time, uuid
+import os, re, time, uuid, json
 import xml.sax.saxutils as _sax
 from flask import Flask, request, jsonify, send_file, Response
 from docx import Document
@@ -364,20 +364,21 @@ def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Stages:
-#   start               -> choose "type" or "template"
-#   ask_type             -> waiting for the document type
-#   ask_facts            -> waiting for facts/details (type path)
-#   ask_template          -> waiting for the pasted template text
-#   ask_template_details -> waiting for facts/details (template path)
-#   ask_side             -> waiting for which side the draft favours
+#   start                 -> choose "type" or "template"
+#   ask_type              -> waiting for the document type (short, typed inline)
+#   ask_facts             -> waiting for facts/details, entered via popup (type path)
+#   ask_template          -> waiting for the pasted template text, entered via popup
+#   ask_template_details  -> waiting for facts/details, entered via popup (template path)
+#   ask_side              -> waiting for which side the draft favours (only asked when
+#                            the AI pipeline determines the document type is adversarial)
 #   brainstorm            -> free-form chat with the AI; draft can be generated
 #                            at any point from here on
 
 START_BUTTONS = [
-    {"label": "Name the draft type & enter details",
-     "value": "I'll name the type of draft and enter the details."},
-    {"label": "Provide a template + enter data",
-     "value": "I'll provide a template and enter the data for it."},
+    {"label": "Specify Document Type",
+     "value": "I'd like to specify the type of document and enter the details myself."},
+    {"label": "Use a Reference Template",
+     "value": "I'd like to provide a reference template and enter the data to fill into it."},
 ]
 
 SIDE_BUTTONS = [
@@ -416,10 +417,12 @@ def get_conversation(conv_id: str):
     return CONVS.get(conv_id)
 
 
-def push(conv, role, content, buttons=None):
+def push(conv, role, content, buttons=None, modal=None):
     entry = {"role": role, "content": content}
     if buttons:
         entry["buttons"] = buttons
+    if modal:
+        entry["modal"] = modal
     conv["messages"].append(entry)
     return entry
 
@@ -433,8 +436,9 @@ BRAINSTORM_SYSTEM_TMPL = (
     "- Facts / details supplied: {details}\n"
     "- Side this draft must favour / be enforced in favour of: {side}\n\n"
     "Your job in this chat:\n"
-    "- Think and respond from the standpoint of the stated side, so the draft ends up "
-    "strongly and correctly serving that side's interests.\n"
+    "- If a side is specified, think and respond from that standpoint, so the draft ends up "
+    "strongly and correctly serving that side's interests. If no side is specified, treat this "
+    "as a neutral or bilateral document and keep your suggestions balanced.\n"
     "- Suggest structure, clauses, arguments, or missing facts that would strengthen the draft.\n"
     "- Ask short, targeted clarifying questions when something important is missing or ambiguous.\n"
     "- Keep replies conversational and concise (a few sentences or a short list) — this is a "
@@ -442,7 +446,15 @@ BRAINSTORM_SYSTEM_TMPL = (
     "- When the discussion has enough to work with, tell the user they can hit 'Generate Draft' "
     "whenever they're ready.\n"
     "- Never say you cannot help with legal matters — you are a drafting tool for the user's own "
-    "professional or personal use; give substantive, practical drafting help."
+    "professional or personal use; give substantive, practical drafting help.\n\n"
+    "RESPONSE FORMAT — reply with ONLY a single valid JSON object, nothing before or after it, "
+    "no markdown code fences, shaped exactly like this:\n"
+    '{{"reply": "your conversational message as plain text — never use double asterisks for '
+    'emphasis", "quick_replies": [{{"label": "Short button text", "value": "Full text sent if the '
+    'user clicks it"}}]}}\n'
+    "Populate quick_replies with 2-4 short items ONLY when your reply ends in a closed-set "
+    "clarifying question that has a small number of obvious discrete answers (e.g. yes/no, or a "
+    "choice between a few named options). Otherwise return an empty array for quick_replies."
 )
 
 DRAFT_SYSTEM = (
@@ -454,8 +466,10 @@ DRAFT_SYSTEM = (
     "plain paragraphs, then the operative clauses or averments as a numbered list (\"1. \", "
     "\"2. \", ...), then a prayer/relief clause where applicable, and finally a verification "
     "and signature block.\n"
-    "The document must be written squarely from the standpoint of, and in the interest of, "
-    "the side specified below — its framing, emphasis and relief sought should serve that side.\n"
+    "If a side is specified below, the document must be written squarely from the standpoint "
+    "of, and in the interest of, that side — its framing, emphasis and relief sought should "
+    "serve that side. If no side is specified, draft the document in neutral, standard form "
+    "appropriate to its type (e.g. a mutual agreement, affidavit, undertaking, or declaration).\n"
     "Use precise, formal legal language appropriate to the jurisdiction implied by the details "
     "given. Output ONLY the document text — no commentary, notes, or explanations outside it."
 )
@@ -467,67 +481,118 @@ def stage_start(conv, text):
         conv["mode"] = "template"
         conv["stage"] = "ask_template"
         push(conv, "assistant",
-             "Sure — paste the template text below (you can include placeholders like "
-             "[NAME], [DATE], etc.). I'll use it as the structure for your draft.")
+             "Understood — you'd like to work from a reference template. Click below to paste "
+             "it in (placeholders like [NAME], [DATE], etc. are fine).",
+             modal={"title": "Reference Template",
+                    "placeholder": "Paste your template text here...",
+                    "submit_label": "Save Template"})
     else:
         conv["mode"] = "type"
         conv["stage"] = "ask_type"
         push(conv, "assistant",
-             "What type of document do you want to draft? (e.g. Legal Notice, Reply to Notice, "
-             "Plaint, Written Statement, Affidavit, Agreement, etc.)")
+             "What type of document would you like to draft? (e.g. Legal Notice, Reply to "
+             "Notice, Plaint, Written Statement, Affidavit, Agreement)")
 
 
 def stage_ask_type(conv, text):
     conv["doc_type"] = text.strip()
     conv["stage"] = "ask_facts"
     push(conv, "assistant",
-         f"Got it — a {conv['doc_type']}. Now give me the facts and details for it "
+         f"Got it — a {conv['doc_type']}. Click below to enter the facts and details "
          f"(parties, dates, key events, amounts, relief sought — whatever you have; you can "
-         f"add more later).")
+         f"add more later).",
+         modal={"title": f"Facts & Details — {conv['doc_type']}",
+                "placeholder": "Parties, dates, key events, amounts, relief sought...",
+                "submit_label": "Save Details"})
 
 
 def stage_ask_facts(conv, text):
     conv["details"] = text.strip()
-    conv["stage"] = "ask_side"
-    push(conv, "assistant",
-         "Understood. Which side is this draft for — whose interest should it be written to "
-         "favour or enforce?", buttons=SIDE_BUTTONS)
+    decide_side_stage(conv)
 
 
 def stage_ask_template(conv, text):
     conv["template_text"] = text.strip()
     conv["stage"] = "ask_template_details"
     push(conv, "assistant",
-         "Thanks — got the template. Now give me the data to fill into it (names, dates, "
-         "amounts, and any other specifics).")
+         "Template received. Click below to enter the data to fill into it (names, dates, "
+         "amounts, and any other specifics).",
+         modal={"title": "Data for Template",
+                "placeholder": "Names, dates, amounts, and other specifics...",
+                "submit_label": "Save Data"})
 
 
 def stage_ask_template_details(conv, text):
     conv["details"] = text.strip()
-    conv["stage"] = "ask_side"
-    push(conv, "assistant",
-         "Understood. Which side is this draft for — whose interest should it be written to "
-         "favour or enforce?", buttons=SIDE_BUTTONS)
+    decide_side_stage(conv)
+
+
+def needs_side_question(conv) -> bool:
+    """Ask the AI pipeline whether this document type is inherently adversarial (so a
+    favoured side needs to be picked) or neutral/bilateral (so the question can be skipped)."""
+    doc_type = conv["doc_type"] or "(unspecified — inferred from the reference template)"
+    context = (conv["template_text"] or conv["details"])[:1500]
+    prompt = (
+        f'Document type: "{doc_type}"\n'
+        f'Details / template excerpt:\n"""{context}"""\n\n'
+        'Does drafting this document require picking one contesting party whose interest the '
+        'document should favour or enforce — as with a legal notice, plaint, written statement, '
+        'reply to notice, or complaint? Or is it a neutral, bilateral, or administrative document '
+        '— such as a mutual agreement, affidavit of facts, NOC, power of attorney, undertaking, or '
+        'declaration — where no single side needs to be favoured?\n'
+        'Reply with exactly one word: YES or NO.'
+    )
+    answer = ai_generate(prompt, temperature=0).strip().upper()
+    return answer.startswith("Y")
+
+
+def decide_side_stage(conv):
+    """After facts/data are collected, decide — via the AI pipeline — whether asking which
+    side the draft should favour is actually relevant, and either ask it or skip straight
+    to the brainstorm."""
+    try:
+        needs_side = needs_side_question(conv)
+    except Exception:
+        needs_side = True  # safest default if the classification call fails
+
+    if needs_side:
+        conv["stage"] = "ask_side"
+        push(conv, "assistant",
+             "Which side is this draft for — whose interest should it be written to favour "
+             "or enforce?", buttons=SIDE_BUTTONS)
+    else:
+        conv["side"] = ""
+        conv["stage"] = "brainstorm"
+        try:
+            reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
+        except Exception as e:
+            reply_text, quick_replies = (
+                f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
+                f"like in the draft, or click Generate Draft when ready.", [])
+        push(conv, "assistant", reply_text, buttons=quick_replies)
 
 
 def stage_ask_side(conv, text):
     conv["side"] = text.strip()
     conv["stage"] = "brainstorm"
     try:
-        reply = run_brainstorm_turn(conv, opening=True)
+        reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
     except Exception as e:
-        reply = (f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
-                 f"like in the draft, or click Generate Draft when ready.")
-    push(conv, "assistant", reply)
+        reply_text, quick_replies = (
+            f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
+            f"like in the draft, or click Generate Draft when ready.", [])
+    push(conv, "assistant", reply_text, buttons=quick_replies)
 
 
 def stage_brainstorm(conv, text):
     conv["brainstorm"].append({"role": "user", "content": text})
     try:
-        reply = run_brainstorm_turn(conv, opening=False)
+        reply_text, quick_replies = run_brainstorm_turn(conv, opening=False)
     except Exception as e:
-        reply = f"(AI is temporarily unavailable: {e}) Feel free to try again, or click Generate Draft."
-    push(conv, "assistant", reply)
+        reply_text, quick_replies = (
+            f"(AI is temporarily unavailable: {e}) Feel free to try again, or click "
+            f"Generate Draft.", [])
+    push(conv, "assistant", reply_text, buttons=quick_replies)
 
 
 STAGE_HANDLERS = {
@@ -541,25 +606,51 @@ STAGE_HANDLERS = {
 }
 
 
-def run_brainstorm_turn(conv, opening=False) -> str:
+def run_brainstorm_turn(conv, opening=False):
+    """Run one brainstorm turn. Returns (reply_text, quick_replies) where quick_replies
+    is a list of {label, value} dicts suitable for rendering as clickable buttons."""
     system = BRAINSTORM_SYSTEM_TMPL.format(
         doc_type=conv["doc_type"] or "(based on the supplied template)",
         has_template="yes" if conv["template_text"] else "no",
         details=conv["details"][:3000] or "(none yet)",
-        side=conv["side"] or "(not specified)",
+        side=conv["side"] or "(not specified — draft neutrally)",
     )
     messages = [{"role": "system", "content": system}]
     messages.extend(conv["brainstorm"][-16:])
     if opening:
         messages.append({"role": "user", "content":
-            "Kick off the brainstorm: briefly note how you'll approach this draft for our "
-            "side, and ask 1-2 short questions if anything important is still missing."})
-    reply = ai_chat(messages, temperature=0.6)
-    conv["brainstorm"].append({"role": "assistant", "content": reply})
-    return reply
+            "Kick off the brainstorm: briefly note how you'll approach this draft, and ask "
+            "1-2 short questions if anything important is still missing."})
+    raw = ai_chat(messages, temperature=0.6)
+    reply_text, quick_replies = _parse_brainstorm_json(raw)
+    conv["brainstorm"].append({"role": "assistant", "content": reply_text})
+    return reply_text, quick_replies
+
+
+def _parse_brainstorm_json(raw: str):
+    """Best-effort parse of the model's structured {reply, quick_replies} JSON. Falls back
+    to treating the raw text as the reply (with no quick-reply buttons) if parsing fails."""
+    text = raw.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    try:
+        data = json.loads(text)
+        reply = str(data.get("reply", "")).strip() or raw.strip()
+        raw_quick = data.get("quick_replies") or []
+        quick_replies = []
+        for item in raw_quick[:4]:
+            if isinstance(item, dict) and item.get("label") and item.get("value"):
+                quick_replies.append({
+                    "label": str(item["label"])[:40],
+                    "value": str(item["value"]),
+                })
+        return reply, quick_replies
+    except Exception:
+        return raw.strip(), []
 
 
 def generate_draft(conv) -> str:
+    side_line = conv["side"] or "(none specified — draft in neutral, standard form for this document type)"
     if conv["template_text"]:
         prompt = (
             f'Use the following as the FORMAT/STRUCTURE reference — follow its layout, clause '
@@ -567,7 +658,7 @@ def generate_draft(conv) -> str:
             f'details with the DATA and brainstorm notes below. Fill in any gaps sensibly.\n\n'
             f'--- FORMAT REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
             f'--- DATA TO USE ---\n{conv["details"]}\n\n'
-            f'--- SIDE THIS MUST FAVOUR ---\n{conv["side"]}\n\n'
+            f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
             f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
             f'Now produce the complete final document text.'
         )
@@ -575,7 +666,7 @@ def generate_draft(conv) -> str:
         prompt = (
             f'Draft a "{conv["doc_type"]}" document using the following details and data:\n\n'
             f'{conv["details"]}\n\n'
-            f'--- SIDE THIS MUST FAVOUR ---\n{conv["side"]}\n\n'
+            f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
             f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
             f'Produce the complete, professional, ready-to-use document text.'
         )
@@ -682,7 +773,7 @@ def index():
 #  FRONTEND (single-page chat app)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -739,7 +830,32 @@ HTML = """<!DOCTYPE html>
   }
   .qr-btn:hover{background:var(--maroon); color:#fff;}
   .qr-btn:disabled{opacity:.4; cursor:not-allowed;}
+  .modal-trigger-btn{
+    margin-top:8px; border:1px solid var(--maroon); background:var(--maroon); color:#fff;
+    padding:8px 14px; border-radius:8px; font-size:13px; cursor:pointer; transition:.15s;
+    align-self:flex-start;
+  }
+  .modal-trigger-btn:hover{background:var(--maroon-dark);}
   .typing{font-size:13px; color:var(--muted); padding:0 16px 8px; font-style:italic;}
+
+  .modal-overlay{
+    position:fixed; inset:0; background:rgba(28,26,25,.45); display:none;
+    align-items:center; justify-content:center; z-index:50; padding:20px;
+  }
+  .modal-overlay.open{display:flex;}
+  .modal-box{
+    background:var(--panel); border-radius:12px; width:100%; max-width:560px;
+    padding:22px 22px 18px; box-shadow:0 12px 40px rgba(0,0,0,.25);
+  }
+  .modal-box h3{margin:0 0 4px; color:var(--maroon); font-size:16px;}
+  .modal-box .modal-hint{margin:0 0 14px; font-size:12.5px; color:var(--muted);}
+  .modal-box textarea{
+    width:100%; min-height:200px; resize:vertical; border:1px solid var(--line);
+    border-radius:8px; padding:12px 14px; font-size:14px; font-family:inherit;
+    outline:none; box-sizing:border-box;
+  }
+  .modal-box textarea:focus{border-color:var(--maroon);}
+  .modal-actions{display:flex; justify-content:flex-end; gap:10px; margin-top:14px;}
 
   #composer{
     display:flex; gap:10px; padding:14px 16px; border-top:1px solid var(--line);
@@ -829,6 +945,18 @@ HTML = """<!DOCTYPE html>
   </div>
 </main>
 
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal-box">
+    <h3 id="modal-title">Enter Details</h3>
+    <p class="modal-hint">This opens in its own window so you can enter everything comfortably before it's added to the chat.</p>
+    <textarea id="modal-textarea" placeholder=""></textarea>
+    <div class="modal-actions">
+      <button class="btn" id="modal-cancel">Cancel</button>
+      <button class="btn primary" id="modal-submit">Submit</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let convId = sessionStorage.getItem('dratido_conv_id') || null;
 let canGenerate = false;
@@ -845,9 +973,23 @@ const panelFooter = document.getElementById('panel-footer');
 
 function scrollBottom(){ messagesEl.scrollTop = messagesEl.scrollHeight; }
 
+// Renders plain text as real bold (no literal ** markup) and preserves line breaks.
+function richText(text){
+  const esc = (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return esc
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*(?!\*)([^*\n]+?)\*(?!\*)/g, '$1<strong>$2</strong>')
+    .replace(/\n/g, '<br>');
+}
+
 function renderMessages(msgs){
   messagesEl.innerHTML = '';
-  msgs.forEach(m => {
+  let modalToAutoOpen = null;
+
+  msgs.forEach((m, idx) => {
     const row = document.createElement('div');
     row.className = 'row ' + (m.role === 'user' ? 'user' : 'assistant');
     const bubbleWrap = document.createElement('div');
@@ -857,8 +999,17 @@ function renderMessages(msgs){
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    bubble.textContent = m.content;
+    bubble.innerHTML = richText(m.content);
     bubbleWrap.appendChild(bubble);
+
+    if (m.modal){
+      const openBtn = document.createElement('button');
+      openBtn.className = 'modal-trigger-btn';
+      openBtn.textContent = '✎ ' + (m.modal.submit_label || 'Enter Details');
+      openBtn.onclick = () => openModal(m.modal);
+      bubbleWrap.appendChild(openBtn);
+      if (idx === msgs.length - 1) modalToAutoOpen = m.modal;
+    }
 
     if (m.buttons && m.buttons.length){
       const qr = document.createElement('div');
@@ -876,7 +1027,29 @@ function renderMessages(msgs){
     messagesEl.appendChild(row);
   });
   scrollBottom();
+  if (modalToAutoOpen) setTimeout(() => openModal(modalToAutoOpen), 300);
 }
+
+function openModal(cfg){
+  document.getElementById('modal-title').textContent = cfg.title || 'Enter Details';
+  const ta = document.getElementById('modal-textarea');
+  ta.placeholder = cfg.placeholder || '';
+  ta.value = '';
+  document.getElementById('modal-submit').textContent = cfg.submit_label || 'Submit';
+  document.getElementById('modal-overlay').classList.add('open');
+  setTimeout(() => ta.focus(), 50);
+}
+function closeModal(){
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+document.getElementById('modal-cancel').onclick = closeModal;
+document.getElementById('modal-submit').onclick = () => {
+  const ta = document.getElementById('modal-textarea');
+  const val = ta.value.trim();
+  if (!val){ ta.focus(); return; }
+  closeModal();
+  sendMessage(val);
+};
 
 function setBusy(busy){
   typingEl.style.display = busy ? 'block' : 'none';
