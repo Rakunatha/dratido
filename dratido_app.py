@@ -22,14 +22,13 @@ Usage:
 """
 
 import os, re, time, uuid, json
-import html as _html_lib
-from urllib.parse import urlparse, parse_qs, unquote
 import xml.sax.saxutils as _sax
 from flask import Flask, request, jsonify, send_file, Response
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import parse_xml
+from pypdf import PdfReader
 
 app = Flask(__name__)
 
@@ -223,77 +222,45 @@ def ai_generate(prompt: str, system: str = "", temperature: float = 0.6) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WEB SEARCH  (find candidate reference templates, no API key required)
+#  TEMPLATE FILE EXTRACTION  (.docx / .pdf uploads)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SEARCH_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
-
-_RESULT_LINK_RE = re.compile(
-    r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S
-)
-_TAG_RE = re.compile(r'<[^>]+>')
+ALLOWED_TEMPLATE_EXTENSIONS = {'.docx', '.pdf'}
+MAX_TEMPLATE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
 
 
-def _clean_html_text(fragment: str) -> str:
-    text = _TAG_RE.sub('', fragment)
-    return _html_lib.unescape(text).strip()
+def extract_text_from_docx(file_stream) -> str:
+    """Pull readable text (paragraphs + table cells, in document order) out of an
+    uploaded .docx reference template."""
+    doc = Document(file_stream)
+    parts = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            parts.append(para.text.strip())
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append('\t'.join(cells))
+    return '\n'.join(parts).strip()
 
 
-def web_search_for_templates(query: str, max_results: int = 5):
-    """Search the web (DuckDuckGo's no-JS HTML endpoint — no API key needed) for candidate
-    reference-document templates. Returns a list of {title, url, domain} dicts, best-effort;
-    returns an empty list on any failure rather than raising, so callers can fall back
-    gracefully to manual template entry."""
-    import requests as _req
-
-    search_query = f"{query} template format sample"
-    try:
-        resp = _req.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": search_query},
-            headers={"User-Agent": _SEARCH_USER_AGENT},
-            timeout=15,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[WebSearch] Search request failed: {e}")
-        return []
-
-    results = []
-    seen_urls = set()
-    for match in _RESULT_LINK_RE.finditer(resp.text):
-        raw_href, raw_title = match.group(1), match.group(2)
-        real_url = raw_href
-        if 'uddg=' in raw_href:
-            qs = parse_qs(urlparse(raw_href).query)
-            if 'uddg' in qs:
-                real_url = unquote(qs['uddg'][0])
-        if not real_url.startswith('http') or real_url in seen_urls:
-            continue
-        title = _clean_html_text(raw_title) or real_url
-        domain = urlparse(real_url).netloc.replace('www.', '')
-        results.append({"title": title, "url": real_url, "domain": domain})
-        seen_urls.add(real_url)
-        if len(results) >= max_results:
-            break
-    return results
-
-
-def fetch_page_text(url: str, max_chars: int = 6000) -> str:
-    """Best-effort extraction of readable text from a web page, for use as reference-template
-    source material. Strips scripts/styles/tags and collapses whitespace."""
-    import requests as _req
-
-    resp = _req.get(url, headers={"User-Agent": _SEARCH_USER_AGENT}, timeout=15)
-    resp.raise_for_status()
-    body = resp.text
-    body = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', ' ', body, flags=re.S | re.I)
-    text = _clean_html_text(body)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text[:max_chars]
+def extract_text_from_pdf(file_stream) -> str:
+    """Pull readable text out of an uploaded .pdf reference template, page by page.
+    Scanned/image-only PDFs will yield little or no text — callers should treat an
+    empty result as a failure and ask the user for another file."""
+    reader = PdfReader(file_stream)
+    if getattr(reader, "is_encrypted", False):
+        try:
+            reader.decrypt('')
+        except Exception:
+            pass
+    parts = []
+    for page in reader.pages:
+        text = (page.extract_text() or '').strip()
+        if text:
+            parts.append(text)
+    return '\n\n'.join(parts).strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -440,15 +407,12 @@ def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Stages:
-#   start                 -> choose "type", "template", or "web_template"
+#   start                 -> choose "type" or "template"
 #   ask_type              -> waiting for the document type (via searchable list/modal)
 #   ask_facts             -> waiting for facts/details, entered via popup (type path)
-#   ask_template          -> waiting for the pasted template text, entered via popup
-#   ask_web_query         -> waiting for a description of the template to search the web for
-#   ask_web_pick          -> waiting for the user to pick one of the web search results
-#                            (or opt to paste their own instead)
-#   ask_template_details  -> waiting for facts/details, entered via popup (template path,
-#                            reached from either the paste flow or the web-search flow)
+#   ask_template          -> waiting for the reference template — uploaded as a .docx/.pdf
+#                            file (drag & drop, browse, or device paste) or pasted as text
+#   ask_template_details  -> waiting for facts/details, entered via popup (template path)
 #   ask_side              -> waiting for which side the draft favours (only asked when
 #                            the AI pipeline determines the document type is adversarial)
 #   brainstorm            -> free-form chat with the AI; draft can be generated
@@ -459,8 +423,6 @@ START_BUTTONS = [
      "value": "I'd like to specify the type of document and enter the details myself."},
     {"label": "Use a Reference Template",
      "value": "I'd like to provide a reference template and enter the data to fill into it."},
-    {"label": "Search the Web for a Template",
-     "value": "I'd like to search the web for a reference template."},
 ]
 
 DOCUMENT_TYPES = [
@@ -546,7 +508,7 @@ def new_conversation() -> dict:
     conv = {
         "id": conv_id,
         "stage": "start",
-        "mode": None,          # "type" | "template" | "web_template"
+        "mode": None,          # "type" | "template"
         "doc_type": "",
         "template_text": "",
         "template_source": "",  # human-readable note on where the template came from
@@ -556,8 +518,6 @@ def new_conversation() -> dict:
         "brainstorm": [],      # {role, content} sent to the LLM during brainstorming
         "draft_text": "",
         "docx_path": "",
-        "web_query": "",
-        "web_results": {},     # url -> {title, url, domain}, for the "search the web" flow
     }
     CONVS[conv_id] = conv
     return conv
@@ -638,32 +598,21 @@ DRAFT_SYSTEM = (
 
 
 TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it."
-WEB_SEARCH_SWITCH_VALUE = "I'd like to search the web for a reference template."
-WEB_PICK_PASTE_OWN = "__paste_own__"
-WEB_PICK_SEARCH_AGAIN = "__search_again__"
 
 
 def start_template_mode(conv):
     conv["mode"] = "template"
     conv["stage"] = "ask_template"
     push(conv, "assistant",
-         "Understood — you'd like to work from a reference template. Click below to paste "
-         "it in (placeholders like [NAME], [DATE], etc. are fine).",
-         modal={"title": "Reference Template",
+         "Understood — you'd like to work from a reference template. Upload a .docx or .pdf "
+         "file below (drag & drop, tap to browse, or paste a copied document) — or paste the "
+         "template text directly if you'd rather (placeholders like [NAME], [DATE], etc. are fine).",
+         modal={"type": "upload",
+                "title": "Reference Template",
+                "hint": "Drop a .docx or .pdf file, tap to browse, or paste a copied document.",
+                "accept": ".docx,.pdf",
                 "placeholder": "Paste your template text here...",
                 "submit_label": "Save Template"})
-
-
-def start_web_search_mode(conv):
-    conv["mode"] = "web_template"
-    conv["stage"] = "ask_web_query"
-    push(conv, "assistant",
-         "Sure — tell me what kind of template you're looking for (e.g. \"rental agreement "
-         "format India\", \"legal notice for cheque bounce\"), and I'll search the web for a "
-         "few options you can pick from.",
-         modal={"title": "Search the Web for a Template",
-                "placeholder": "Describe the document/template you're looking for...",
-                "submit_label": "Search"})
 
 
 def ask_for_template_details(conv, intro_text):
@@ -678,9 +627,7 @@ def ask_for_template_details(conv, intro_text):
 
 def stage_start(conv, text):
     lower = text.lower()
-    if 'search' in lower and 'web' in lower:
-        start_web_search_mode(conv)
-    elif 'template' in lower:
+    if 'template' in lower:
         start_template_mode(conv)
     else:
         conv["mode"] = "type"
@@ -699,9 +646,6 @@ def stage_ask_type(conv, text):
     stripped = text.strip()
     if stripped == TEMPLATE_SWITCH_VALUE:
         start_template_mode(conv)
-        return
-    if stripped == WEB_SEARCH_SWITCH_VALUE:
-        start_web_search_mode(conv)
         return
     conv["doc_type"] = stripped
     conv["stage"] = "ask_facts"
@@ -727,100 +671,6 @@ def stage_ask_template(conv, text):
         "Template received. Click below to enter the data to fill into it (names, dates, "
         "amounts, and any other specifics)."
     )
-
-
-def stage_ask_web_query(conv, text):
-    conv["web_query"] = text.strip()
-    try:
-        results = web_search_for_templates(conv["web_query"], max_results=5)
-    except Exception as e:
-        print(f"[WebSearch] Unexpected error: {e}")
-        results = []
-
-    if not results:
-        conv["web_results"] = {}
-        push(conv, "assistant",
-             "I couldn't find any usable results for that search. You can try describing it "
-             "differently, or paste your own reference template instead.",
-             buttons=[{"label": "🔍 Try a Different Search", "value": WEB_PICK_SEARCH_AGAIN},
-                      {"label": "✎ Paste My Own Template", "value": WEB_PICK_PASTE_OWN}])
-        conv["stage"] = "ask_web_pick"
-        return
-
-    conv["web_results"] = {r["url"]: r for r in results}
-    conv["stage"] = "ask_web_pick"
-    buttons = []
-    for r in results:
-        label = r["title"][:55] + ("…" if len(r["title"]) > 55 else "")
-        buttons.append({"label": f'{label} — {r["domain"]}', "value": r["url"]})
-    buttons.append({"label": "🔍 Search Again", "value": WEB_PICK_SEARCH_AGAIN})
-    buttons.append({"label": "✎ Paste My Own Instead", "value": WEB_PICK_PASTE_OWN})
-    push(conv, "assistant",
-         "Here's what I found — pick one to use as the reference template, search again, or "
-         "paste your own.", buttons=buttons)
-
-
-def stage_ask_web_pick(conv, text):
-    choice = text.strip()
-
-    if choice == WEB_PICK_PASTE_OWN:
-        start_template_mode(conv)
-        return
-
-    if choice == WEB_PICK_SEARCH_AGAIN:
-        conv["web_results"] = {}
-        push(conv, "assistant",
-             "No problem — what should I search for instead?",
-             modal={"title": "Search the Web for a Template",
-                    "placeholder": "Describe the document/template you're looking for...",
-                    "submit_label": "Search"})
-        conv["stage"] = "ask_web_query"
-        return
-
-    result = conv.get("web_results", {}).get(choice)
-    if not result:
-        # Unrecognised input (e.g. stale button click) — fall back to a fresh search prompt.
-        push(conv, "assistant",
-             "I didn't recognise that choice. What should I search for?",
-             modal={"title": "Search the Web for a Template",
-                    "placeholder": "Describe the document/template you're looking for...",
-                    "submit_label": "Search"})
-        conv["stage"] = "ask_web_query"
-        return
-
-    try:
-        page_text = fetch_page_text(result["url"])
-    except Exception as e:
-        print(f"[WebSearch] Fetch failed for {result['url']}: {e}")
-        page_text = ""
-
-    if not page_text:
-        push(conv, "assistant",
-             f"I couldn't retrieve usable content from \"{result['title']}\" — that page may "
-             f"block automated access. Pick another result, search again, or paste your own "
-             f"template.",
-             buttons=[{"label": lbl["label"], "value": lbl["value"]}
-                      for lbl in _rebuild_web_pick_buttons(conv)])
-        return
-
-    conv["template_text"] = page_text
-    conv["template_source"] = f'{result["title"]} ({result["domain"]})'
-    conv["mode"] = "template"
-    ask_for_template_details(
-        conv,
-        f'Got reference material from "{result["title"]}" ({result["domain"]}). Click below '
-        f'to enter the data to fill into it (names, dates, amounts, and any other specifics).'
-    )
-
-
-def _rebuild_web_pick_buttons(conv):
-    buttons = []
-    for r in conv.get("web_results", {}).values():
-        label = r["title"][:55] + ("…" if len(r["title"]) > 55 else "")
-        buttons.append({"label": f'{label} — {r["domain"]}', "value": r["url"]})
-    buttons.append({"label": "🔍 Search Again", "value": WEB_PICK_SEARCH_AGAIN})
-    buttons.append({"label": "✎ Paste My Own Instead", "value": WEB_PICK_PASTE_OWN})
-    return buttons
 
 
 def stage_ask_template_details(conv, text):
@@ -901,8 +751,6 @@ STAGE_HANDLERS = {
     "ask_type":              stage_ask_type,
     "ask_facts":             stage_ask_facts,
     "ask_template":          stage_ask_template,
-    "ask_web_query":         stage_ask_web_query,
-    "ask_web_pick":          stage_ask_web_pick,
     "ask_template_details":  stage_ask_template_details,
     "ask_side":              stage_ask_side,
     "brainstorm":            stage_brainstorm,
@@ -1015,6 +863,69 @@ def api_message():
     if not handler:
         return jsonify({"success": False, "message": "Unknown stage."}), 400
     handler(conv, text)
+
+    return jsonify({
+        "success": True,
+        "messages": conv["messages"],
+        "stage": conv["stage"],
+        "can_generate": conv["stage"] == "brainstorm",
+    })
+
+
+@app.route('/api/upload_template', methods=['POST'])
+def api_upload_template():
+    conv_id = request.form.get('conv_id', '')
+    conv = get_conversation(conv_id)
+    if not conv:
+        return jsonify({"success": False, "message": "Conversation not found. Start a new draft."}), 404
+    if conv["stage"] != "ask_template":
+        return jsonify({"success": False, "message": "Not expecting a template upload right now."}), 400
+
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify({"success": False, "message": "No file received."}), 400
+
+    filename = f.filename
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_TEMPLATE_EXTENSIONS:
+        return jsonify({"success": False, "message": "Please upload a .docx or .pdf file."}), 400
+
+    f.stream.seek(0, os.SEEK_END)
+    size = f.stream.tell()
+    f.stream.seek(0)
+    if size == 0:
+        return jsonify({"success": False, "message": "That file appears to be empty."}), 400
+    if size > MAX_TEMPLATE_UPLOAD_BYTES:
+        return jsonify({"success": False, "message": "That file is too large (max 15 MB)."}), 400
+
+    try:
+        if ext == '.docx':
+            extracted = extract_text_from_docx(f.stream)
+        else:
+            extracted = extract_text_from_pdf(f.stream)
+    except Exception as e:
+        print(f"[Upload] Extraction failed for {filename}: {e}")
+        return jsonify({"success": False,
+                        "message": "Couldn't read that file — it may be corrupted, password-protected, "
+                                   "or an unsupported format. Try another file or paste the template "
+                                   "text instead."}), 400
+
+    if not extracted.strip():
+        return jsonify({"success": False,
+                        "message": "No readable text was found in that file (it may be a scanned "
+                                   "image rather than real text). Try another file or paste the "
+                                   "template text instead."}), 400
+
+    push(conv, "user", f"📎 Uploaded template: {filename}")
+
+    conv["template_text"] = extracted
+    conv["template_source"] = f"uploaded file: {filename}"
+    conv["mode"] = "template"
+    ask_for_template_details(
+        conv,
+        f'Got it — I\'ve read "{filename}". Click below to enter the data to fill into it '
+        f'(names, dates, amounts, and any other specifics).'
+    )
 
     return jsonify({
         "success": True,
@@ -1187,6 +1098,24 @@ HTML = r"""<!DOCTYPE html>
   }
   .modal-template-switch-btn:hover{background:var(--maroon); color:#fff; border-style:solid;}
 
+  .modal-upload-zone{
+    border:2px dashed var(--line); border-radius:10px; padding:30px 16px; text-align:center;
+    cursor:pointer; transition:.15s; background:var(--paper);
+  }
+  .modal-upload-zone.drag{border-color:var(--maroon); background:#f6ece7;}
+  .modal-upload-zone .icon{font-size:30px; margin-bottom:8px;}
+  .modal-upload-zone .main-text{font-size:14px; color:var(--ink); font-weight:600;}
+  .modal-upload-zone .sub-text{font-size:12px; color:var(--muted); margin-top:5px; line-height:1.5;}
+  .modal-paste-input{
+    width:100%; margin-top:12px; border:1px dashed var(--line); border-radius:8px;
+    padding:9px 12px; font-size:12.5px; font-family:inherit; color:var(--muted);
+    resize:none; height:38px; outline:none; box-sizing:border-box;
+  }
+  .modal-paste-input:focus{border-color:var(--maroon); color:var(--ink);}
+  #modal-upload-status{
+    font-size:12.5px; color:var(--maroon); margin-top:10px; min-height:16px; text-align:center;
+  }
+
   #composer{
     display:flex; gap:10px; padding:14px 16px; border-top:1px solid var(--line);
     background:var(--panel); flex-shrink:0; align-items:flex-end;
@@ -1292,9 +1221,23 @@ HTML = r"""<!DOCTYPE html>
       <input type="text" id="modal-search" placeholder="Search document types..." autocomplete="off">
       <div id="modal-list-results"></div>
       <button class="modal-template-switch-btn" id="modal-template-switch">⇄ Use a Reference Template Instead</button>
-      <button class="modal-template-switch-btn" id="modal-web-search-switch">🔍 Search the Web for a Template Instead</button>
       <div class="modal-actions">
         <button class="btn" id="modal-list-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <div id="modal-upload-mode" style="display:none;">
+      <div class="modal-upload-zone" id="modal-upload-zone">
+        <div class="icon">📎</div>
+        <div class="main-text">Drop your template here, or tap to browse</div>
+        <div class="sub-text">.docx or .pdf files only</div>
+      </div>
+      <input type="file" id="modal-file-input" accept=".docx,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="display:none;">
+      <textarea id="modal-paste-catcher" class="modal-paste-input" rows="1" placeholder="On iPhone/iPad: tap here, then Paste a copied document"></textarea>
+      <div id="modal-upload-status"></div>
+      <button class="modal-template-switch-btn" id="modal-upload-toggle-text">✎ Or Paste the Template Text Instead</button>
+      <div class="modal-actions">
+        <button class="btn" id="modal-upload-cancel">Cancel</button>
       </div>
     </div>
   </div>
@@ -1375,29 +1318,37 @@ function renderMessages(msgs){
 
 const textModeEl = document.getElementById('modal-text-mode');
 const listModeEl = document.getElementById('modal-list-mode');
+const uploadModeEl = document.getElementById('modal-upload-mode');
 const modalHintEl = document.getElementById('modal-hint');
 const modalSearchEl = document.getElementById('modal-search');
 const modalListResultsEl = document.getElementById('modal-list-results');
 const TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it.";
-const WEB_SEARCH_SWITCH_VALUE = "I'd like to search the web for a reference template.";
 let currentModalGroups = [];
+let currentUploadCfg = null;
 
 function openModal(cfg){
   document.getElementById('modal-title').textContent = cfg.title || 'Enter Details';
+  textModeEl.style.display = 'none';
+  listModeEl.style.display = 'none';
+  uploadModeEl.style.display = 'none';
 
   if (cfg.type === 'list'){
     modalHintEl.textContent = 'Search or scroll to find your document type.';
-    textModeEl.style.display = 'none';
     listModeEl.style.display = 'block';
     currentModalGroups = cfg.groups || [];
     modalSearchEl.value = '';
     renderModalList('');
     document.getElementById('modal-overlay').classList.add('open');
     setTimeout(() => modalSearchEl.focus(), 50);
+  } else if (cfg.type === 'upload'){
+    modalHintEl.textContent = cfg.hint || 'Drop a file, tap to browse, or paste a copied document.';
+    uploadModeEl.style.display = 'block';
+    currentUploadCfg = cfg;
+    resetUploadZone();
+    document.getElementById('modal-overlay').classList.add('open');
   } else {
     modalHintEl.textContent = "This opens in its own window so you can enter everything comfortably before it's added to the chat.";
     textModeEl.style.display = 'block';
-    listModeEl.style.display = 'none';
     const ta = document.getElementById('modal-textarea');
     ta.placeholder = cfg.placeholder || '';
     ta.value = '';
@@ -1409,6 +1360,98 @@ function openModal(cfg){
 function closeModal(){
   document.getElementById('modal-overlay').classList.remove('open');
 }
+
+function switchToTextMode(prefill){
+  uploadModeEl.style.display = 'none';
+  textModeEl.style.display = 'block';
+  const ta = document.getElementById('modal-textarea');
+  ta.placeholder = (currentUploadCfg && currentUploadCfg.placeholder) || 'Paste your template text here...';
+  ta.value = prefill || '';
+  document.getElementById('modal-submit').textContent = (currentUploadCfg && currentUploadCfg.submit_label) || 'Save Template';
+  setTimeout(() => ta.focus(), 50);
+}
+
+const uploadZoneEl = document.getElementById('modal-upload-zone');
+const fileInputEl = document.getElementById('modal-file-input');
+const pasteCatcherEl = document.getElementById('modal-paste-catcher');
+const uploadStatusEl = document.getElementById('modal-upload-status');
+
+function resetUploadZone(){
+  uploadZoneEl.classList.remove('drag');
+  uploadStatusEl.textContent = '';
+  fileInputEl.value = '';
+  pasteCatcherEl.value = '';
+}
+
+function isValidTemplateFile(file){
+  const name = (file.name || '').toLowerCase();
+  return name.endsWith('.docx') || name.endsWith('.pdf');
+}
+
+async function uploadTemplateFile(file){
+  if (!isValidTemplateFile(file)){
+    uploadStatusEl.textContent = 'Please choose a .docx or .pdf file.';
+    return;
+  }
+  if (file.size > 15 * 1024 * 1024){
+    uploadStatusEl.textContent = 'That file is too large (max 15 MB).';
+    return;
+  }
+  uploadStatusEl.textContent = 'Reading ' + (file.name || 'your file') + '…';
+  setBusy(true);
+  try{
+    const fd = new FormData();
+    fd.append('conv_id', convId);
+    fd.append('file', file, file.name || 'template');
+    const res = await fetch('/api/upload_template', {method:'POST', body: fd});
+    const data = await res.json();
+    setBusy(false);
+    if (data.success){
+      closeModal();
+      renderMessages(data.messages);
+      canGenerate = !!data.can_generate;
+      generateBtn.style.display = canGenerate ? 'inline-block' : 'none';
+    } else {
+      uploadStatusEl.textContent = data.message || 'Could not read that file.';
+    }
+  } catch (err){
+    setBusy(false);
+    uploadStatusEl.textContent = 'Upload failed. Please try again.';
+  }
+}
+
+uploadZoneEl.addEventListener('click', () => fileInputEl.click());
+uploadZoneEl.addEventListener('dragover', (e) => { e.preventDefault(); uploadZoneEl.classList.add('drag'); });
+uploadZoneEl.addEventListener('dragleave', () => uploadZoneEl.classList.remove('drag'));
+uploadZoneEl.addEventListener('drop', (e) => {
+  e.preventDefault();
+  uploadZoneEl.classList.remove('drag');
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) uploadTemplateFile(file);
+});
+fileInputEl.addEventListener('change', () => {
+  const file = fileInputEl.files && fileInputEl.files[0];
+  if (file) uploadTemplateFile(file);
+});
+// Handles the "document paste" gesture on iOS/iPadOS (copy a file in Files/Share sheet,
+// then long-press > Paste here) as well as desktop Ctrl+V of a copied file. Falls back to
+// treating a plain-text paste as pasted template text.
+pasteCatcherEl.addEventListener('paste', (e) => {
+  const files = (e.clipboardData && e.clipboardData.files) ? Array.from(e.clipboardData.files) : [];
+  if (files.length){
+    e.preventDefault();
+    uploadTemplateFile(files[0]);
+    pasteCatcherEl.value = '';
+    return;
+  }
+  setTimeout(() => {
+    const pasted = pasteCatcherEl.value.trim();
+    if (pasted) switchToTextMode(pasted);
+    pasteCatcherEl.value = '';
+  }, 0);
+});
+document.getElementById('modal-upload-toggle-text').onclick = () => switchToTextMode('');
+document.getElementById('modal-upload-cancel').onclick = closeModal;
 
 function renderModalList(filterRaw){
   const filter = (filterRaw || '').trim().toLowerCase();
@@ -1448,10 +1491,6 @@ document.getElementById('modal-list-cancel').onclick = closeModal;
 document.getElementById('modal-template-switch').onclick = () => {
   closeModal();
   sendMessage(TEMPLATE_SWITCH_VALUE);
-};
-document.getElementById('modal-web-search-switch').onclick = () => {
-  closeModal();
-  sendMessage(WEB_SEARCH_SWITCH_VALUE);
 };
 
 document.getElementById('modal-cancel').onclick = closeModal;
