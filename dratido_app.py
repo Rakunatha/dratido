@@ -22,6 +22,8 @@ Usage:
 """
 
 import os, re, time, uuid, json
+import html as _html_lib
+from urllib.parse import urlparse, parse_qs, unquote
 import xml.sax.saxutils as _sax
 from flask import Flask, request, jsonify, send_file, Response
 from docx import Document
@@ -221,6 +223,80 @@ def ai_generate(prompt: str, system: str = "", temperature: float = 0.6) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  WEB SEARCH  (find candidate reference templates, no API key required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+_RESULT_LINK_RE = re.compile(
+    r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S
+)
+_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _clean_html_text(fragment: str) -> str:
+    text = _TAG_RE.sub('', fragment)
+    return _html_lib.unescape(text).strip()
+
+
+def web_search_for_templates(query: str, max_results: int = 5):
+    """Search the web (DuckDuckGo's no-JS HTML endpoint — no API key needed) for candidate
+    reference-document templates. Returns a list of {title, url, domain} dicts, best-effort;
+    returns an empty list on any failure rather than raising, so callers can fall back
+    gracefully to manual template entry."""
+    import requests as _req
+
+    search_query = f"{query} template format sample"
+    try:
+        resp = _req.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": search_query},
+            headers={"User-Agent": _SEARCH_USER_AGENT},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[WebSearch] Search request failed: {e}")
+        return []
+
+    results = []
+    seen_urls = set()
+    for match in _RESULT_LINK_RE.finditer(resp.text):
+        raw_href, raw_title = match.group(1), match.group(2)
+        real_url = raw_href
+        if 'uddg=' in raw_href:
+            qs = parse_qs(urlparse(raw_href).query)
+            if 'uddg' in qs:
+                real_url = unquote(qs['uddg'][0])
+        if not real_url.startswith('http') or real_url in seen_urls:
+            continue
+        title = _clean_html_text(raw_title) or real_url
+        domain = urlparse(real_url).netloc.replace('www.', '')
+        results.append({"title": title, "url": real_url, "domain": domain})
+        seen_urls.add(real_url)
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def fetch_page_text(url: str, max_chars: int = 6000) -> str:
+    """Best-effort extraction of readable text from a web page, for use as reference-template
+    source material. Strips scripts/styles/tags and collapses whitespace."""
+    import requests as _req
+
+    resp = _req.get(url, headers={"User-Agent": _SEARCH_USER_AGENT}, timeout=15)
+    resp.raise_for_status()
+    body = resp.text
+    body = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', ' ', body, flags=re.S | re.I)
+    text = _clean_html_text(body)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:max_chars]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  DOCX BUILDING
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -287,7 +363,7 @@ def add_watermark(doc, text: str = DRATIDO_WATERMARK_TEXT):
 
 def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
     """Convert the AI-drafted plain-text legal document into a formatted,
-    watermarked .docx file resembling a formal Indian court filing."""
+    watermarked .docx file resembling a formal court filing."""
     doc = Document()
     for sec in doc.sections:
         sec.page_width    = Inches(8.5)
@@ -364,11 +440,15 @@ def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Stages:
-#   start                 -> choose "type" or "template"
-#   ask_type              -> waiting for the document type (short, typed inline)
+#   start                 -> choose "type", "template", or "web_template"
+#   ask_type              -> waiting for the document type (via searchable list/modal)
 #   ask_facts             -> waiting for facts/details, entered via popup (type path)
 #   ask_template          -> waiting for the pasted template text, entered via popup
-#   ask_template_details  -> waiting for facts/details, entered via popup (template path)
+#   ask_web_query         -> waiting for a description of the template to search the web for
+#   ask_web_pick          -> waiting for the user to pick one of the web search results
+#                            (or opt to paste their own instead)
+#   ask_template_details  -> waiting for facts/details, entered via popup (template path,
+#                            reached from either the paste flow or the web-search flow)
 #   ask_side              -> waiting for which side the draft favours (only asked when
 #                            the AI pipeline determines the document type is adversarial)
 #   brainstorm            -> free-form chat with the AI; draft can be generated
@@ -379,6 +459,8 @@ START_BUTTONS = [
      "value": "I'd like to specify the type of document and enter the details myself."},
     {"label": "Use a Reference Template",
      "value": "I'd like to provide a reference template and enter the data to fill into it."},
+    {"label": "Search the Web for a Template",
+     "value": "I'd like to search the web for a reference template."},
 ]
 
 DOCUMENT_TYPES = [
@@ -393,11 +475,14 @@ DOCUMENT_TYPES = [
         "Written Arguments", "Memo of Appeal (Civil)", "Revision Petition",
         "Review Petition", "Execution Petition",
     ]},
-    {"group": "Criminal Matters", "items": [
-        "Complaint under Section 200 CrPC", "FIR / Complaint to Police",
-        "Bail Application (Regular)", "Anticipatory Bail Application",
-        "Quashing Petition (Section 482 CrPC)", "Criminal Appeal",
-        "Criminal Revision", "Protest Petition",
+    {"group": "Criminal Matters (BNS, BNSS & BSA)", "items": [
+        "Complaint under Section 223 BNSS (formerly Sec. 200 CrPC)",
+        "FIR / Complaint to Police (Section 173 BNSS)",
+        "Bail Application — Regular (Section 480 BNSS)",
+        "Anticipatory Bail Application (Section 482 BNSS)",
+        "Quashing Petition (Section 528 BNSS, formerly Sec. 482 CrPC)",
+        "Application under Section 63 BSA (Electronic Evidence Certificate)",
+        "Criminal Appeal", "Criminal Revision", "Protest Petition",
     ]},
     {"group": "Affidavits & Declarations", "items": [
         "Affidavit of Facts", "Affidavit of Income", "Affidavit of Address Proof",
@@ -413,7 +498,7 @@ DOCUMENT_TYPES = [
     ]},
     {"group": "Family Law", "items": [
         "Divorce Petition (Mutual Consent)", "Divorce Petition (Contested)",
-        "Maintenance Petition (Section 125 CrPC)",
+        "Maintenance Petition (Section 144 BNSS, formerly Sec. 125 CrPC)",
         "Domestic Violence Complaint", "Child Custody Petition",
         "Adoption Deed", "Will / Testament",
         "Succession Certificate Petition",
@@ -450,8 +535,8 @@ SIDE_BUTTONS = [
 ]
 
 WELCOME_MSG = (
-    "Hi, I'm Dratido — your Indian legal drafting assistant. I'll help you brainstorm and "
-    "put together a draft under Indian law, then hand you a clean Word document at the end.\n\n"
+    "Hi, I'm Dratido — your drafting assistant. I'll help you brainstorm and put together a "
+    "draft, then hand you a clean Word document at the end.\n\n"
     "How would you like to start?"
 )
 
@@ -461,15 +546,18 @@ def new_conversation() -> dict:
     conv = {
         "id": conv_id,
         "stage": "start",
-        "mode": None,          # "type" | "template"
+        "mode": None,          # "type" | "template" | "web_template"
         "doc_type": "",
         "template_text": "",
+        "template_source": "",  # human-readable note on where the template came from
         "details": "",
         "side": "",
         "messages": [],        # full transcript, for display
         "brainstorm": [],      # {role, content} sent to the LLM during brainstorming
         "draft_text": "",
         "docx_path": "",
+        "web_query": "",
+        "web_results": {},     # url -> {title, url, domain}, for the "search the web" flow
     }
     CONVS[conv_id] = conv
     return conv
@@ -490,19 +578,19 @@ def push(conv, role, content, buttons=None, modal=None):
 
 
 BRAINSTORM_SYSTEM_TMPL = (
-    "You are Dratido, a collaborative AI drafting assistant specialised in Indian law. You are "
-    "helping the user brainstorm and refine a legal draft — governed by Indian statutes, rules, "
-    "and court-filing conventions — before it is generated as a final document.\n\n"
+    "You are Dratido, a collaborative AI drafting assistant. You are helping the user "
+    "brainstorm and refine a legal draft before it is generated as a final document.\n\n"
     "Context for this draft:\n"
     "- Document type: {doc_type}\n"
     "- Reference template supplied by user: {has_template}\n"
     "- Facts / details supplied: {details}\n"
     "- Side this draft must favour / be enforced in favour of: {side}\n\n"
     "Your job in this chat:\n"
-    "- Assume an Indian legal context throughout — refer to the relevant Indian Acts, Rules, "
-    "Sections, or procedural codes (e.g. CPC, CrPC/BNSS, Indian Contract Act, Indian Evidence "
-    "Act/BSA, Transfer of Property Act, Companies Act) where they are relevant to the document, "
-    "unless the user's own details clearly indicate a different jurisdiction.\n"
+    "- Refer to the relevant Acts, Rules, Sections, or procedural codes where they are relevant "
+    "to the document — including the current codes (BNS, BNSS, BSA) in place of any superseded "
+    "ones (IPC, CrPC, Evidence Act) for criminal-law matters, alongside CPC, Contract Act, "
+    "Transfer of Property Act, Companies Act, etc. as applicable — based on the user's own "
+    "details.\n"
     "- If a side is specified, think and respond from that standpoint, so the draft ends up "
     "strongly and correctly serving that side's interests. If no side is specified, treat this "
     "as a neutral or bilateral document and keep your suggestions balanced.\n"
@@ -526,29 +614,33 @@ BRAINSTORM_SYSTEM_TMPL = (
 )
 
 DRAFT_SYSTEM = (
-    "You are an expert Indian legal drafter trained in Indian court-filing and legal-drafting "
+    "You are an expert legal drafter trained in formal court-filing and legal-drafting "
     "conventions. Draft a complete, professional, ready-to-use legal document in plain text "
     "(no markdown, no asterisks, no code fences).\n"
-    "Draft strictly in accordance with Indian law, procedure, and formatting conventions — citing "
-    "the relevant Indian Acts, Sections, or procedural codes (e.g. CPC, CrPC/BNSS, Indian Contract "
-    "Act, Indian Evidence Act/BSA, Transfer of Property Act, Companies Act, or other applicable "
-    "Indian statute) where appropriate to the document type — unless the user's own details "
-    "clearly indicate a different jurisdiction.\n"
+    "Draft strictly in accordance with the applicable procedure and formatting conventions — "
+    "citing the relevant Acts, Sections, or procedural codes where appropriate to the document "
+    "type, including the current codes (BNS, BNSS, BSA) in place of any superseded ones (IPC, "
+    "CrPC, Evidence Act) for criminal-law matters, alongside CPC, Contract Act, Transfer of "
+    "Property Act, Companies Act, or other applicable statute — based on the user's own "
+    "details.\n"
     "Structure: a centred ALL-CAPS title on the first line (naming the document and, where "
-    "appropriate, a case-number / court placeholder in the Indian format), then the cause-title / "
-    "parties / preamble as plain paragraphs, then the operative clauses or averments as a numbered "
-    "list (\"1. \", \"2. \", ...), then a prayer/relief clause where applicable, and finally a "
-    "verification and signature block in the form used in Indian pleadings and deeds.\n"
+    "appropriate, a case-number / court placeholder), then the cause-title / parties / preamble "
+    "as plain paragraphs, then the operative clauses or averments as a numbered list (\"1. \", "
+    "\"2. \", ...), then a prayer/relief clause where applicable, and finally a verification and "
+    "signature block in the form used in formal pleadings and deeds.\n"
     "If a side is specified below, the document must be written squarely from the standpoint "
     "of, and in the interest of, that side — its framing, emphasis and relief sought should "
     "serve that side. If no side is specified, draft the document in neutral, standard form "
     "appropriate to its type (e.g. a mutual agreement, affidavit, undertaking, or declaration).\n"
-    "Use precise, formal legal language appropriate to Indian practice. Output ONLY the document "
-    "text — no commentary, notes, or explanations outside it."
+    "Use precise, formal legal language appropriate to standard legal drafting practice. Output "
+    "ONLY the document text — no commentary, notes, or explanations outside it."
 )
 
 
 TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it."
+WEB_SEARCH_SWITCH_VALUE = "I'd like to search the web for a reference template."
+WEB_PICK_PASTE_OWN = "__paste_own__"
+WEB_PICK_SEARCH_AGAIN = "__search_again__"
 
 
 def start_template_mode(conv):
@@ -562,15 +654,39 @@ def start_template_mode(conv):
                 "submit_label": "Save Template"})
 
 
+def start_web_search_mode(conv):
+    conv["mode"] = "web_template"
+    conv["stage"] = "ask_web_query"
+    push(conv, "assistant",
+         "Sure — tell me what kind of template you're looking for (e.g. \"rental agreement "
+         "format India\", \"legal notice for cheque bounce\"), and I'll search the web for a "
+         "few options you can pick from.",
+         modal={"title": "Search the Web for a Template",
+                "placeholder": "Describe the document/template you're looking for...",
+                "submit_label": "Search"})
+
+
+def ask_for_template_details(conv, intro_text):
+    """Shared transition into the 'enter data to fill into the template' step, used by both
+    the paste-your-own-template flow and the search-the-web flow."""
+    conv["stage"] = "ask_template_details"
+    push(conv, "assistant", intro_text,
+         modal={"title": "Data for Template",
+                "placeholder": "Names, dates, amounts, and other specifics...",
+                "submit_label": "Save Data"})
+
+
 def stage_start(conv, text):
     lower = text.lower()
-    if 'template' in lower:
+    if 'search' in lower and 'web' in lower:
+        start_web_search_mode(conv)
+    elif 'template' in lower:
         start_template_mode(conv)
     else:
         conv["mode"] = "type"
         conv["stage"] = "ask_type"
         push(conv, "assistant",
-             "What type of Indian legal document would you like to draft? Click below to "
+             "What type of document would you like to draft? Click below to "
              "search or scroll through the list — or switch to a reference template instead.",
              modal={"type": "list",
                     "title": "Select Document Type",
@@ -580,10 +696,14 @@ def stage_start(conv, text):
 
 
 def stage_ask_type(conv, text):
-    if text.strip() == TEMPLATE_SWITCH_VALUE:
+    stripped = text.strip()
+    if stripped == TEMPLATE_SWITCH_VALUE:
         start_template_mode(conv)
         return
-    conv["doc_type"] = text.strip()
+    if stripped == WEB_SEARCH_SWITCH_VALUE:
+        start_web_search_mode(conv)
+        return
+    conv["doc_type"] = stripped
     conv["stage"] = "ask_facts"
     push(conv, "assistant",
          f"Got it — a {conv['doc_type']}. Click below to enter the facts and details "
@@ -601,13 +721,106 @@ def stage_ask_facts(conv, text):
 
 def stage_ask_template(conv, text):
     conv["template_text"] = text.strip()
-    conv["stage"] = "ask_template_details"
+    conv["template_source"] = "pasted by you"
+    ask_for_template_details(
+        conv,
+        "Template received. Click below to enter the data to fill into it (names, dates, "
+        "amounts, and any other specifics)."
+    )
+
+
+def stage_ask_web_query(conv, text):
+    conv["web_query"] = text.strip()
+    try:
+        results = web_search_for_templates(conv["web_query"], max_results=5)
+    except Exception as e:
+        print(f"[WebSearch] Unexpected error: {e}")
+        results = []
+
+    if not results:
+        conv["web_results"] = {}
+        push(conv, "assistant",
+             "I couldn't find any usable results for that search. You can try describing it "
+             "differently, or paste your own reference template instead.",
+             buttons=[{"label": "🔍 Try a Different Search", "value": WEB_PICK_SEARCH_AGAIN},
+                      {"label": "✎ Paste My Own Template", "value": WEB_PICK_PASTE_OWN}])
+        conv["stage"] = "ask_web_pick"
+        return
+
+    conv["web_results"] = {r["url"]: r for r in results}
+    conv["stage"] = "ask_web_pick"
+    buttons = []
+    for r in results:
+        label = r["title"][:55] + ("…" if len(r["title"]) > 55 else "")
+        buttons.append({"label": f'{label} — {r["domain"]}', "value": r["url"]})
+    buttons.append({"label": "🔍 Search Again", "value": WEB_PICK_SEARCH_AGAIN})
+    buttons.append({"label": "✎ Paste My Own Instead", "value": WEB_PICK_PASTE_OWN})
     push(conv, "assistant",
-         "Template received. Click below to enter the data to fill into it (names, dates, "
-         "amounts, and any other specifics).",
-         modal={"title": "Data for Template",
-                "placeholder": "Names, dates, amounts, and other specifics...",
-                "submit_label": "Save Data"})
+         "Here's what I found — pick one to use as the reference template, search again, or "
+         "paste your own.", buttons=buttons)
+
+
+def stage_ask_web_pick(conv, text):
+    choice = text.strip()
+
+    if choice == WEB_PICK_PASTE_OWN:
+        start_template_mode(conv)
+        return
+
+    if choice == WEB_PICK_SEARCH_AGAIN:
+        conv["web_results"] = {}
+        push(conv, "assistant",
+             "No problem — what should I search for instead?",
+             modal={"title": "Search the Web for a Template",
+                    "placeholder": "Describe the document/template you're looking for...",
+                    "submit_label": "Search"})
+        conv["stage"] = "ask_web_query"
+        return
+
+    result = conv.get("web_results", {}).get(choice)
+    if not result:
+        # Unrecognised input (e.g. stale button click) — fall back to a fresh search prompt.
+        push(conv, "assistant",
+             "I didn't recognise that choice. What should I search for?",
+             modal={"title": "Search the Web for a Template",
+                    "placeholder": "Describe the document/template you're looking for...",
+                    "submit_label": "Search"})
+        conv["stage"] = "ask_web_query"
+        return
+
+    try:
+        page_text = fetch_page_text(result["url"])
+    except Exception as e:
+        print(f"[WebSearch] Fetch failed for {result['url']}: {e}")
+        page_text = ""
+
+    if not page_text:
+        push(conv, "assistant",
+             f"I couldn't retrieve usable content from \"{result['title']}\" — that page may "
+             f"block automated access. Pick another result, search again, or paste your own "
+             f"template.",
+             buttons=[{"label": lbl["label"], "value": lbl["value"]}
+                      for lbl in _rebuild_web_pick_buttons(conv)])
+        return
+
+    conv["template_text"] = page_text
+    conv["template_source"] = f'{result["title"]} ({result["domain"]})'
+    conv["mode"] = "template"
+    ask_for_template_details(
+        conv,
+        f'Got reference material from "{result["title"]}" ({result["domain"]}). Click below '
+        f'to enter the data to fill into it (names, dates, amounts, and any other specifics).'
+    )
+
+
+def _rebuild_web_pick_buttons(conv):
+    buttons = []
+    for r in conv.get("web_results", {}).values():
+        label = r["title"][:55] + ("…" if len(r["title"]) > 55 else "")
+        buttons.append({"label": f'{label} — {r["domain"]}', "value": r["url"]})
+    buttons.append({"label": "🔍 Search Again", "value": WEB_PICK_SEARCH_AGAIN})
+    buttons.append({"label": "✎ Paste My Own Instead", "value": WEB_PICK_PASTE_OWN})
+    return buttons
 
 
 def stage_ask_template_details(conv, text):
@@ -688,6 +901,8 @@ STAGE_HANDLERS = {
     "ask_type":              stage_ask_type,
     "ask_facts":             stage_ask_facts,
     "ask_template":          stage_ask_template,
+    "ask_web_query":         stage_ask_web_query,
+    "ask_web_pick":          stage_ask_web_pick,
     "ask_template_details":  stage_ask_template_details,
     "ask_side":              stage_ask_side,
     "brainstorm":            stage_brainstorm,
@@ -866,7 +1081,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Dratido — Indian Legal Drafting</title>
+<title>Dratido — Draft Till Done</title>
 <style>
   :root{
     --maroon:#8B1E2D; --maroon-dark:#6e1723; --ink:#1c1a19; --paper:#faf7f2;
@@ -966,7 +1181,7 @@ HTML = r"""<!DOCTYPE html>
   .modal-list-item:hover{background:#f1e9dd; color:var(--maroon);}
   .modal-list-empty{padding:16px 10px; color:var(--muted); font-size:13.5px; text-align:center;}
   .modal-template-switch-btn{
-    display:block; width:100%; margin-top:12px; border:1px dashed var(--maroon);
+    display:block; width:100%; margin-top:10px; border:1px dashed var(--maroon);
     background:#fff; color:var(--maroon); border-radius:8px; padding:10px 14px;
     font-size:13.5px; font-weight:600; cursor:pointer; transition:.15s;
   }
@@ -1025,7 +1240,7 @@ HTML = r"""<!DOCTYPE html>
 <header>
   <div class="brand">
     <span class="name">Dratido</span>
-    <span class="tagline">Draft Till Done · Indian Legal Drafting</span>
+    <span class="tagline">Draft Till Done</span>
   </div>
   <div class="header-actions">
     <button class="btn" id="panel-toggle">Draft ▤</button>
@@ -1077,6 +1292,7 @@ HTML = r"""<!DOCTYPE html>
       <input type="text" id="modal-search" placeholder="Search document types..." autocomplete="off">
       <div id="modal-list-results"></div>
       <button class="modal-template-switch-btn" id="modal-template-switch">⇄ Use a Reference Template Instead</button>
+      <button class="modal-template-switch-btn" id="modal-web-search-switch">🔍 Search the Web for a Template Instead</button>
       <div class="modal-actions">
         <button class="btn" id="modal-list-cancel">Cancel</button>
       </div>
@@ -1163,13 +1379,14 @@ const modalHintEl = document.getElementById('modal-hint');
 const modalSearchEl = document.getElementById('modal-search');
 const modalListResultsEl = document.getElementById('modal-list-results');
 const TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it.";
+const WEB_SEARCH_SWITCH_VALUE = "I'd like to search the web for a reference template.";
 let currentModalGroups = [];
 
 function openModal(cfg){
   document.getElementById('modal-title').textContent = cfg.title || 'Enter Details';
 
   if (cfg.type === 'list'){
-    modalHintEl.textContent = 'Search or scroll to find your document type under Indian law.';
+    modalHintEl.textContent = 'Search or scroll to find your document type.';
     textModeEl.style.display = 'none';
     listModeEl.style.display = 'block';
     currentModalGroups = cfg.groups || [];
@@ -1231,6 +1448,10 @@ document.getElementById('modal-list-cancel').onclick = closeModal;
 document.getElementById('modal-template-switch').onclick = () => {
   closeModal();
   sendMessage(TEMPLATE_SWITCH_VALUE);
+};
+document.getElementById('modal-web-search-switch').onclick = () => {
+  closeModal();
+  sendMessage(WEB_SEARCH_SWITCH_VALUE);
 };
 
 document.getElementById('modal-cancel').onclick = closeModal;
@@ -1359,7 +1580,7 @@ if __name__ == '__main__':
     key_str = '\u2713 Groq \u2014 ready!' if groq_key else '\u2717 NOT SET \u2014 see below'
     print('\n' + '=' * 60)
     print(f'  {APP_NAME} \u2014 {APP_TAGLINE}')
-    print('  AI drafting assistant for Indian law — chat-first, no login')
+    print('  AI drafting assistant — chat-first, no login')
     print('  Powered by Groq (free tier)')
     print('  Open browser:  http://127.0.0.1:8081')
     print(f'  GROQ_API_KEY: {key_str}')
