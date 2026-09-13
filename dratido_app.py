@@ -450,8 +450,8 @@ SIDE_BUTTONS = [
 ]
 
 WELCOME_MSG = (
-    "Hi, I'm Dratido — your drafting assistant. I'll help you brainstorm and put "
-    "together a legal draft, then hand you a clean Word document at the end.\n\n"
+    "Hi, I'm Dratido — your Indian legal drafting assistant. I'll help you brainstorm and "
+    "put together a draft under Indian law, then hand you a clean Word document at the end.\n\n"
     "How would you like to start?"
 )
 
@@ -490,19 +490,25 @@ def push(conv, role, content, buttons=None, modal=None):
 
 
 BRAINSTORM_SYSTEM_TMPL = (
-    "You are Dratido, a collaborative AI drafting assistant. You are helping the user "
-    "brainstorm and refine a legal draft before it is generated as a final document.\n\n"
+    "You are Dratido, a collaborative AI drafting assistant specialised in Indian law. You are "
+    "helping the user brainstorm and refine a legal draft — governed by Indian statutes, rules, "
+    "and court-filing conventions — before it is generated as a final document.\n\n"
     "Context for this draft:\n"
     "- Document type: {doc_type}\n"
     "- Reference template supplied by user: {has_template}\n"
     "- Facts / details supplied: {details}\n"
     "- Side this draft must favour / be enforced in favour of: {side}\n\n"
     "Your job in this chat:\n"
+    "- Assume an Indian legal context throughout — refer to the relevant Indian Acts, Rules, "
+    "Sections, or procedural codes (e.g. CPC, CrPC/BNSS, Indian Contract Act, Indian Evidence "
+    "Act/BSA, Transfer of Property Act, Companies Act) where they are relevant to the document, "
+    "unless the user's own details clearly indicate a different jurisdiction.\n"
     "- If a side is specified, think and respond from that standpoint, so the draft ends up "
     "strongly and correctly serving that side's interests. If no side is specified, treat this "
     "as a neutral or bilateral document and keep your suggestions balanced.\n"
     "- Suggest structure, clauses, arguments, or missing facts that would strengthen the draft.\n"
-    "- Ask short, targeted clarifying questions when something important is missing or ambiguous.\n"
+    "- Ask short, targeted clarifying questions when something important is missing or ambiguous "
+    "(e.g. which state/court, applicable limitation period, stamp duty considerations).\n"
     "- Keep replies conversational and concise (a few sentences or a short list) — this is a "
     "brainstorm, not the final document.\n"
     "- When the discussion has enough to work with, tell the user they can hit 'Generate Draft' "
@@ -520,40 +526,52 @@ BRAINSTORM_SYSTEM_TMPL = (
 )
 
 DRAFT_SYSTEM = (
-    "You are an expert legal drafter trained in formal court-filing conventions. Draft a "
-    "complete, professional, ready-to-use legal document in plain text (no markdown, no "
-    "asterisks, no code fences).\n"
+    "You are an expert Indian legal drafter trained in Indian court-filing and legal-drafting "
+    "conventions. Draft a complete, professional, ready-to-use legal document in plain text "
+    "(no markdown, no asterisks, no code fences).\n"
+    "Draft strictly in accordance with Indian law, procedure, and formatting conventions — citing "
+    "the relevant Indian Acts, Sections, or procedural codes (e.g. CPC, CrPC/BNSS, Indian Contract "
+    "Act, Indian Evidence Act/BSA, Transfer of Property Act, Companies Act, or other applicable "
+    "Indian statute) where appropriate to the document type — unless the user's own details "
+    "clearly indicate a different jurisdiction.\n"
     "Structure: a centred ALL-CAPS title on the first line (naming the document and, where "
-    "appropriate, a case-number placeholder), then the cause-title / parties / preamble as "
-    "plain paragraphs, then the operative clauses or averments as a numbered list (\"1. \", "
-    "\"2. \", ...), then a prayer/relief clause where applicable, and finally a verification "
-    "and signature block.\n"
+    "appropriate, a case-number / court placeholder in the Indian format), then the cause-title / "
+    "parties / preamble as plain paragraphs, then the operative clauses or averments as a numbered "
+    "list (\"1. \", \"2. \", ...), then a prayer/relief clause where applicable, and finally a "
+    "verification and signature block in the form used in Indian pleadings and deeds.\n"
     "If a side is specified below, the document must be written squarely from the standpoint "
     "of, and in the interest of, that side — its framing, emphasis and relief sought should "
     "serve that side. If no side is specified, draft the document in neutral, standard form "
     "appropriate to its type (e.g. a mutual agreement, affidavit, undertaking, or declaration).\n"
-    "Use precise, formal legal language appropriate to the jurisdiction implied by the details "
-    "given. Output ONLY the document text — no commentary, notes, or explanations outside it."
+    "Use precise, formal legal language appropriate to Indian practice. Output ONLY the document "
+    "text — no commentary, notes, or explanations outside it."
 )
+
+
+TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it."
+
+
+def start_template_mode(conv):
+    conv["mode"] = "template"
+    conv["stage"] = "ask_template"
+    push(conv, "assistant",
+         "Understood — you'd like to work from a reference template. Click below to paste "
+         "it in (placeholders like [NAME], [DATE], etc. are fine).",
+         modal={"title": "Reference Template",
+                "placeholder": "Paste your template text here...",
+                "submit_label": "Save Template"})
 
 
 def stage_start(conv, text):
     lower = text.lower()
     if 'template' in lower:
-        conv["mode"] = "template"
-        conv["stage"] = "ask_template"
-        push(conv, "assistant",
-             "Understood — you'd like to work from a reference template. Click below to paste "
-             "it in (placeholders like [NAME], [DATE], etc. are fine).",
-             modal={"title": "Reference Template",
-                    "placeholder": "Paste your template text here...",
-                    "submit_label": "Save Template"})
+        start_template_mode(conv)
     else:
         conv["mode"] = "type"
         conv["stage"] = "ask_type"
         push(conv, "assistant",
-             "What type of document would you like to draft? Click below to search or "
-             "scroll through the list — or type your own if you don't see it.",
+             "What type of Indian legal document would you like to draft? Click below to "
+             "search or scroll through the list — or switch to a reference template instead.",
              modal={"type": "list",
                     "title": "Select Document Type",
                     "placeholder": "Search document types...",
@@ -562,6 +580,9 @@ def stage_start(conv, text):
 
 
 def stage_ask_type(conv, text):
+    if text.strip() == TEMPLATE_SWITCH_VALUE:
+        start_template_mode(conv)
+        return
     conv["doc_type"] = text.strip()
     conv["stage"] = "ask_facts"
     push(conv, "assistant",
@@ -845,7 +866,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Dratido</title>
+<title>Dratido — Indian Legal Drafting</title>
 <style>
   :root{
     --maroon:#8B1E2D; --maroon-dark:#6e1723; --ink:#1c1a19; --paper:#faf7f2;
@@ -944,17 +965,12 @@ HTML = r"""<!DOCTYPE html>
   }
   .modal-list-item:hover{background:#f1e9dd; color:var(--maroon);}
   .modal-list-empty{padding:16px 10px; color:var(--muted); font-size:13.5px; text-align:center;}
-  .modal-custom-row{display:flex; gap:8px; margin-top:12px;}
-  .modal-custom-row input{
-    flex:1; border:1px solid var(--line); border-radius:8px; padding:9px 12px;
-    font-size:13.5px; font-family:inherit; outline:none; box-sizing:border-box;
+  .modal-template-switch-btn{
+    display:block; width:100%; margin-top:12px; border:1px dashed var(--maroon);
+    background:#fff; color:var(--maroon); border-radius:8px; padding:10px 14px;
+    font-size:13.5px; font-weight:600; cursor:pointer; transition:.15s;
   }
-  .modal-custom-row input:focus{border-color:var(--maroon);}
-  .modal-custom-row button{
-    border:1px solid var(--maroon); background:#fff; color:var(--maroon);
-    border-radius:8px; padding:9px 14px; font-size:13px; cursor:pointer; white-space:nowrap;
-  }
-  .modal-custom-row button:hover{background:var(--maroon); color:#fff;}
+  .modal-template-switch-btn:hover{background:var(--maroon); color:#fff; border-style:solid;}
 
   #composer{
     display:flex; gap:10px; padding:14px 16px; border-top:1px solid var(--line);
@@ -1009,7 +1025,7 @@ HTML = r"""<!DOCTYPE html>
 <header>
   <div class="brand">
     <span class="name">Dratido</span>
-    <span class="tagline">Draft Till Done</span>
+    <span class="tagline">Draft Till Done · Indian Legal Drafting</span>
   </div>
   <div class="header-actions">
     <button class="btn" id="panel-toggle">Draft ▤</button>
@@ -1060,10 +1076,7 @@ HTML = r"""<!DOCTYPE html>
     <div id="modal-list-mode" style="display:none;">
       <input type="text" id="modal-search" placeholder="Search document types..." autocomplete="off">
       <div id="modal-list-results"></div>
-      <div class="modal-custom-row">
-        <input type="text" id="modal-custom-input" placeholder="Can't find it? Type your own...">
-        <button id="modal-custom-submit">Use This</button>
-      </div>
+      <button class="modal-template-switch-btn" id="modal-template-switch">⇄ Use a Reference Template Instead</button>
       <div class="modal-actions">
         <button class="btn" id="modal-list-cancel">Cancel</button>
       </div>
@@ -1149,20 +1162,18 @@ const listModeEl = document.getElementById('modal-list-mode');
 const modalHintEl = document.getElementById('modal-hint');
 const modalSearchEl = document.getElementById('modal-search');
 const modalListResultsEl = document.getElementById('modal-list-results');
-const modalCustomInputEl = document.getElementById('modal-custom-input');
+const TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it.";
 let currentModalGroups = [];
 
 function openModal(cfg){
   document.getElementById('modal-title').textContent = cfg.title || 'Enter Details';
 
   if (cfg.type === 'list'){
-    modalHintEl.textContent = 'Search or scroll to find your document type, or type your own below.';
+    modalHintEl.textContent = 'Search or scroll to find your document type under Indian law.';
     textModeEl.style.display = 'none';
     listModeEl.style.display = 'block';
     currentModalGroups = cfg.groups || [];
     modalSearchEl.value = '';
-    modalCustomInputEl.value = '';
-    modalCustomInputEl.placeholder = cfg.placeholder || "Can't find it? Type your own...";
     renderModalList('');
     document.getElementById('modal-overlay').classList.add('open');
     setTimeout(() => modalSearchEl.focus(), 50);
@@ -1210,25 +1221,17 @@ function renderModalList(filterRaw){
   if (!anyMatch){
     const empty = document.createElement('div');
     empty.className = 'modal-list-empty';
-    empty.textContent = 'No matching document type — type your own below.';
+    empty.textContent = 'No matching document type found in the list.';
     modalListResultsEl.appendChild(empty);
   }
 }
 
 modalSearchEl.addEventListener('input', () => renderModalList(modalSearchEl.value));
 document.getElementById('modal-list-cancel').onclick = closeModal;
-document.getElementById('modal-custom-submit').onclick = () => {
-  const val = modalCustomInputEl.value.trim();
-  if (!val){ modalCustomInputEl.focus(); return; }
+document.getElementById('modal-template-switch').onclick = () => {
   closeModal();
-  sendMessage(val);
+  sendMessage(TEMPLATE_SWITCH_VALUE);
 };
-modalCustomInputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter'){
-    e.preventDefault();
-    document.getElementById('modal-custom-submit').click();
-  }
-});
 
 document.getElementById('modal-cancel').onclick = closeModal;
 document.getElementById('modal-submit').onclick = () => {
@@ -1356,7 +1359,7 @@ if __name__ == '__main__':
     key_str = '\u2713 Groq \u2014 ready!' if groq_key else '\u2717 NOT SET \u2014 see below'
     print('\n' + '=' * 60)
     print(f'  {APP_NAME} \u2014 {APP_TAGLINE}')
-    print('  AI drafting assistant — chat-first, no login')
+    print('  AI drafting assistant for Indian law — chat-first, no login')
     print('  Powered by Groq (free tier)')
     print('  Open browser:  http://127.0.0.1:8081')
     print(f'  GROQ_API_KEY: {key_str}')
