@@ -381,6 +381,68 @@ START_BUTTONS = [
      "value": "I'd like to provide a reference template and enter the data to fill into it."},
 ]
 
+DOCUMENT_TYPES = [
+    {"group": "Notices & Replies", "items": [
+        "Legal Notice", "Reply to Legal Notice", "Notice under Section 80 CPC",
+        "Notice under Section 138 NI Act (Cheque Bounce)", "Demand Notice",
+        "Cease and Desist Letter", "Termination Notice",
+    ]},
+    {"group": "Civil Pleadings", "items": [
+        "Plaint", "Written Statement", "Counter Claim", "Rejoinder",
+        "Interlocutory Application", "Application for Interim Injunction",
+        "Written Arguments", "Memo of Appeal (Civil)", "Revision Petition",
+        "Review Petition", "Execution Petition",
+    ]},
+    {"group": "Criminal Matters", "items": [
+        "Complaint under Section 200 CrPC", "FIR / Complaint to Police",
+        "Bail Application (Regular)", "Anticipatory Bail Application",
+        "Quashing Petition (Section 482 CrPC)", "Criminal Appeal",
+        "Criminal Revision", "Protest Petition",
+    ]},
+    {"group": "Affidavits & Declarations", "items": [
+        "Affidavit of Facts", "Affidavit of Income", "Affidavit of Address Proof",
+        "Affidavit for Name Change", "Declaration of Marriage",
+        "Solvency Affidavit", "General Declaration",
+    ]},
+    {"group": "Agreements & Contracts", "items": [
+        "Rental / Lease Agreement", "Sale Agreement", "Partnership Deed",
+        "Employment Agreement", "Non-Disclosure Agreement (NDA)",
+        "Loan Agreement", "Franchise Agreement",
+        "Memorandum of Understanding (MoU)", "Service Agreement",
+        "Joint Venture Agreement", "Vendor Agreement",
+    ]},
+    {"group": "Family Law", "items": [
+        "Divorce Petition (Mutual Consent)", "Divorce Petition (Contested)",
+        "Maintenance Petition (Section 125 CrPC)",
+        "Domestic Violence Complaint", "Child Custody Petition",
+        "Adoption Deed", "Will / Testament",
+        "Succession Certificate Petition",
+    ]},
+    {"group": "Property & Real Estate", "items": [
+        "Sale Deed", "Gift Deed", "Mortgage Deed",
+        "Power of Attorney (General)", "Power of Attorney (Special)",
+        "No Objection Certificate (NOC)", "Relinquishment Deed",
+        "Partition Deed", "Lease Deed",
+    ]},
+    {"group": "Corporate & Commercial", "items": [
+        "Memorandum of Association (MoA)", "Articles of Association (AoA)",
+        "Board Resolution", "Shareholders Agreement",
+        "Indemnity Bond", "Consultancy Agreement",
+    ]},
+    {"group": "Writs & Constitutional", "items": [
+        "Writ Petition (Habeas Corpus)", "Writ Petition (Mandamus)",
+        "Writ Petition (Certiorari)", "Public Interest Litigation (PIL)",
+    ]},
+    {"group": "Consumer & Labour", "items": [
+        "Consumer Complaint", "Labour / Industrial Dispute Complaint",
+        "Application under RTI Act",
+    ]},
+    {"group": "Other", "items": [
+        "Undertaking", "Indemnity Letter", "Authorization Letter",
+        "Deed of Assignment", "Statement of Case",
+    ]},
+]
+
 SIDE_BUTTONS = [
     {"label": "Petitioner / Plaintiff", "value": "Petitioner / Plaintiff side"},
     {"label": "Respondent / Defendant", "value": "Respondent / Defendant side"},
@@ -490,8 +552,13 @@ def stage_start(conv, text):
         conv["mode"] = "type"
         conv["stage"] = "ask_type"
         push(conv, "assistant",
-             "What type of document would you like to draft? (e.g. Legal Notice, Reply to "
-             "Notice, Plaint, Written Statement, Affidavit, Agreement)")
+             "What type of document would you like to draft? Click below to search or "
+             "scroll through the list — or type your own if you don't see it.",
+             modal={"type": "list",
+                    "title": "Select Document Type",
+                    "placeholder": "Search document types...",
+                    "groups": DOCUMENT_TYPES,
+                    "submit_label": "Choose Document Type"})
 
 
 def stage_ask_type(conv, text):
@@ -857,6 +924,38 @@ HTML = r"""<!DOCTYPE html>
   .modal-box textarea:focus{border-color:var(--maroon);}
   .modal-actions{display:flex; justify-content:flex-end; gap:10px; margin-top:14px;}
 
+  #modal-search{
+    width:100%; border:1px solid var(--line); border-radius:8px; padding:10px 14px;
+    font-size:14px; font-family:inherit; outline:none; box-sizing:border-box; margin-bottom:10px;
+  }
+  #modal-search:focus{border-color:var(--maroon);}
+  #modal-list-results{
+    max-height:320px; overflow-y:auto; border:1px solid var(--line); border-radius:8px;
+    padding:6px; background:var(--paper);
+  }
+  .modal-group-heading{
+    font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+    padding:8px 8px 4px; font-weight:600;
+  }
+  .modal-list-item{
+    display:block; width:100%; text-align:left; background:none; border:none;
+    padding:9px 10px; border-radius:6px; font-size:14px; color:var(--ink);
+    cursor:pointer; transition:.12s;
+  }
+  .modal-list-item:hover{background:#f1e9dd; color:var(--maroon);}
+  .modal-list-empty{padding:16px 10px; color:var(--muted); font-size:13.5px; text-align:center;}
+  .modal-custom-row{display:flex; gap:8px; margin-top:12px;}
+  .modal-custom-row input{
+    flex:1; border:1px solid var(--line); border-radius:8px; padding:9px 12px;
+    font-size:13.5px; font-family:inherit; outline:none; box-sizing:border-box;
+  }
+  .modal-custom-row input:focus{border-color:var(--maroon);}
+  .modal-custom-row button{
+    border:1px solid var(--maroon); background:#fff; color:var(--maroon);
+    border-radius:8px; padding:9px 14px; font-size:13px; cursor:pointer; white-space:nowrap;
+  }
+  .modal-custom-row button:hover{background:var(--maroon); color:#fff;}
+
   #composer{
     display:flex; gap:10px; padding:14px 16px; border-top:1px solid var(--line);
     background:var(--panel); flex-shrink:0; align-items:flex-end;
@@ -948,11 +1047,26 @@ HTML = r"""<!DOCTYPE html>
 <div class="modal-overlay" id="modal-overlay">
   <div class="modal-box">
     <h3 id="modal-title">Enter Details</h3>
-    <p class="modal-hint">This opens in its own window so you can enter everything comfortably before it's added to the chat.</p>
-    <textarea id="modal-textarea" placeholder=""></textarea>
-    <div class="modal-actions">
-      <button class="btn" id="modal-cancel">Cancel</button>
-      <button class="btn primary" id="modal-submit">Submit</button>
+    <p class="modal-hint" id="modal-hint">This opens in its own window so you can enter everything comfortably before it's added to the chat.</p>
+
+    <div id="modal-text-mode">
+      <textarea id="modal-textarea" placeholder=""></textarea>
+      <div class="modal-actions">
+        <button class="btn" id="modal-cancel">Cancel</button>
+        <button class="btn primary" id="modal-submit">Submit</button>
+      </div>
+    </div>
+
+    <div id="modal-list-mode" style="display:none;">
+      <input type="text" id="modal-search" placeholder="Search document types..." autocomplete="off">
+      <div id="modal-list-results"></div>
+      <div class="modal-custom-row">
+        <input type="text" id="modal-custom-input" placeholder="Can't find it? Type your own...">
+        <button id="modal-custom-submit">Use This</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="modal-list-cancel">Cancel</button>
+      </div>
     </div>
   </div>
 </div>
@@ -1030,18 +1144,92 @@ function renderMessages(msgs){
   if (modalToAutoOpen) setTimeout(() => openModal(modalToAutoOpen), 300);
 }
 
+const textModeEl = document.getElementById('modal-text-mode');
+const listModeEl = document.getElementById('modal-list-mode');
+const modalHintEl = document.getElementById('modal-hint');
+const modalSearchEl = document.getElementById('modal-search');
+const modalListResultsEl = document.getElementById('modal-list-results');
+const modalCustomInputEl = document.getElementById('modal-custom-input');
+let currentModalGroups = [];
+
 function openModal(cfg){
   document.getElementById('modal-title').textContent = cfg.title || 'Enter Details';
-  const ta = document.getElementById('modal-textarea');
-  ta.placeholder = cfg.placeholder || '';
-  ta.value = '';
-  document.getElementById('modal-submit').textContent = cfg.submit_label || 'Submit';
-  document.getElementById('modal-overlay').classList.add('open');
-  setTimeout(() => ta.focus(), 50);
+
+  if (cfg.type === 'list'){
+    modalHintEl.textContent = 'Search or scroll to find your document type, or type your own below.';
+    textModeEl.style.display = 'none';
+    listModeEl.style.display = 'block';
+    currentModalGroups = cfg.groups || [];
+    modalSearchEl.value = '';
+    modalCustomInputEl.value = '';
+    modalCustomInputEl.placeholder = cfg.placeholder || "Can't find it? Type your own...";
+    renderModalList('');
+    document.getElementById('modal-overlay').classList.add('open');
+    setTimeout(() => modalSearchEl.focus(), 50);
+  } else {
+    modalHintEl.textContent = "This opens in its own window so you can enter everything comfortably before it's added to the chat.";
+    textModeEl.style.display = 'block';
+    listModeEl.style.display = 'none';
+    const ta = document.getElementById('modal-textarea');
+    ta.placeholder = cfg.placeholder || '';
+    ta.value = '';
+    document.getElementById('modal-submit').textContent = cfg.submit_label || 'Submit';
+    document.getElementById('modal-overlay').classList.add('open');
+    setTimeout(() => ta.focus(), 50);
+  }
 }
 function closeModal(){
   document.getElementById('modal-overlay').classList.remove('open');
 }
+
+function renderModalList(filterRaw){
+  const filter = (filterRaw || '').trim().toLowerCase();
+  modalListResultsEl.innerHTML = '';
+  let anyMatch = false;
+
+  currentModalGroups.forEach(group => {
+    const matches = (group.items || []).filter(item => item.toLowerCase().includes(filter));
+    if (!matches.length) return;
+    anyMatch = true;
+    const heading = document.createElement('div');
+    heading.className = 'modal-group-heading';
+    heading.textContent = group.group;
+    modalListResultsEl.appendChild(heading);
+    matches.forEach(item => {
+      const btn = document.createElement('button');
+      btn.className = 'modal-list-item';
+      btn.textContent = item;
+      btn.onclick = () => {
+        closeModal();
+        sendMessage(item);
+      };
+      modalListResultsEl.appendChild(btn);
+    });
+  });
+
+  if (!anyMatch){
+    const empty = document.createElement('div');
+    empty.className = 'modal-list-empty';
+    empty.textContent = 'No matching document type — type your own below.';
+    modalListResultsEl.appendChild(empty);
+  }
+}
+
+modalSearchEl.addEventListener('input', () => renderModalList(modalSearchEl.value));
+document.getElementById('modal-list-cancel').onclick = closeModal;
+document.getElementById('modal-custom-submit').onclick = () => {
+  const val = modalCustomInputEl.value.trim();
+  if (!val){ modalCustomInputEl.focus(); return; }
+  closeModal();
+  sendMessage(val);
+};
+modalCustomInputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter'){
+    e.preventDefault();
+    document.getElementById('modal-custom-submit').click();
+  }
+});
+
 document.getElementById('modal-cancel').onclick = closeModal;
 document.getElementById('modal-submit').onclick = () => {
   const ta = document.getElementById('modal-textarea');
