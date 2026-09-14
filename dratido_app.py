@@ -264,6 +264,109 @@ def extract_text_from_pdf(file_stream) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  MOOT MEMORIAL TEMPLATE LIBRARY  (compressed + encrypted bundled asset)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# A curated set of real, past moot-court memorials was analysed offline and reduced
+# to short "style/structure" excerpts per section (list of abbreviations, index of
+# authorities, statement of jurisdiction, statement of issues, arguments-advanced
+# heading style, prayer for relief) for both the petitioner and respondent side.
+# Case-specific facts and arguments were deliberately NOT retained — only formatting
+# and phrasing conventions — so the library can safely inform drafting for a brand
+# new, unrelated moot problem without leaking someone else's facts.
+#
+# The resulting JSON is compressed and encrypted at rest as an external asset file
+# (moot_templates.enc) rather than shipped as a folder of plaintext PDFs/JSON in the
+# repo. This is asset obfuscation, not a security boundary — the app ships with the
+# key it needs to read its own asset, and anyone with the source can derive it too.
+# Set MOOT_TEMPLATE_PASSPHRASE in the environment to use a different key if desired.
+
+MOOT_TEMPLATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'moot_templates.enc')
+_MOOT_DEFAULT_PASSPHRASE = "dratido-moot-template-library-v1"
+_MOOT_FIXED_SALT = b"dratido-moot-salt-2026-v1-static"
+
+_moot_templates_cache = None
+
+
+def _moot_fernet():
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    passphrase = os.environ.get("MOOT_TEMPLATE_PASSPHRASE", "").strip() or _MOOT_DEFAULT_PASSPHRASE
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=_MOOT_FIXED_SALT, iterations=200_000)
+    key = __import__('base64').urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
+    return Fernet(key)
+
+
+def load_moot_templates():
+    """Decrypt + decompress the bundled moot-memorial style library once per process,
+    then cache it in memory. Returns [] (without raising) if the asset is missing or
+    unreadable, so the moot-memorial flow degrades gracefully to a plain AI draft."""
+    global _moot_templates_cache
+    if _moot_templates_cache is not None:
+        return _moot_templates_cache
+
+    if not os.path.exists(MOOT_TEMPLATES_FILE):
+        print(f"[Moot] Template asset not found at {MOOT_TEMPLATES_FILE}")
+        _moot_templates_cache = []
+        return _moot_templates_cache
+
+    try:
+        with open(MOOT_TEMPLATES_FILE, 'rb') as f:
+            token = f.read()
+        compressed = _moot_fernet().decrypt(token)
+        import zlib
+        raw = zlib.decompress(compressed)
+        _moot_templates_cache = json.loads(raw.decode('utf-8'))
+        print(f"[Moot] Loaded {len(_moot_templates_cache)} moot-memorial style templates")
+    except Exception as e:
+        print(f"[Moot] Failed to load template asset: {e}")
+        _moot_templates_cache = []
+
+    return _moot_templates_cache
+
+
+def _format_moot_reference(skel: dict) -> str:
+    """Render one stored skeleton's excerpts into a single labelled reference block
+    for the drafting prompt."""
+    labelled = [
+        ("LIST OF ABBREVIATIONS (style example)", skel.get("abbreviations_sample")),
+        ("INDEX OF AUTHORITIES (style example)", skel.get("authorities_style")),
+        ("STATEMENT OF JURISDICTION (style example)", skel.get("jurisdiction_example")),
+        ("STATEMENT OF ISSUES (style example)", skel.get("issues_style")),
+        ("ARGUMENTS ADVANCED (heading/style example)", skel.get("arguments_style")),
+        ("PRAYER FOR RELIEF (style example)", skel.get("prayer_example")),
+    ]
+    parts = [f"{label}:\n{text.strip()}" for label, text in labelled if text and text.strip()]
+    return "\n\n".join(parts)
+
+
+def select_moot_reference(side_key: str, user_text: str) -> str:
+    """Pick the stored template that best matches the user's side and (loosely, by
+    keyword overlap) their moot problem, and return it formatted as a style-reference
+    block. Returns '' if the library is unavailable."""
+    templates = load_moot_templates()
+    if not templates:
+        return ""
+
+    matching = [t for t in templates if t.get("side") == side_key] or templates
+
+    user_words = set(re.findall(r'[a-zA-Z]{4,}', (user_text or "").lower()))
+    if not user_words:
+        chosen = matching[0]
+    else:
+        def _score(t):
+            blob = ' '.join([t.get('court', ''), t.get('parties', ''),
+                              t.get('issues_style', ''), t.get('arguments_style', '')]).lower()
+            blob_words = set(re.findall(r'[a-zA-Z]{4,}', blob))
+            return len(user_words & blob_words)
+        chosen = max(matching, key=_score)
+
+    return _format_moot_reference(chosen)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  DOCX BUILDING
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -484,6 +587,9 @@ DOCUMENT_TYPES = [
         "Consumer Complaint", "Labour / Industrial Dispute Complaint",
         "Application under RTI Act",
     ]},
+    {"group": "For Law Students", "items": [
+        "Drafting Memorial for Moot Court",
+    ]},
     {"group": "Other", "items": [
         "Undertaking", "Indemnity Letter", "Authorization Letter",
         "Deed of Assignment", "Statement of Case",
@@ -494,6 +600,15 @@ SIDE_BUTTONS = [
     {"label": "Petitioner / Plaintiff", "value": "Petitioner / Plaintiff side"},
     {"label": "Respondent / Defendant", "value": "Respondent / Defendant side"},
     {"label": "Other — I'll specify", "value": "Other side — let me specify who this favours"},
+]
+
+MOOT_MEMORIAL_DOC_TYPE = "Drafting Memorial for Moot Court"
+
+MOOT_SIDE_BUTTONS = [
+    {"label": "Petitioner / Appellant / Plaintiff",
+     "value": "Petitioner / Appellant / Plaintiff side"},
+    {"label": "Respondent / Defendant",
+     "value": "Respondent / Defendant side"},
 ]
 
 WELCOME_MSG = (
@@ -596,6 +711,36 @@ DRAFT_SYSTEM = (
     "ONLY the document text — no commentary, notes, or explanations outside it."
 )
 
+DRAFT_SYSTEM_MOOT = (
+    "You are an expert moot-court coach and legal drafter. Draft a complete, professional "
+    "MEMORIAL (written submission) for a moot court competition, in plain text (no markdown, "
+    "no asterisks, no code fences).\n"
+    "Produce ALL of the following sections, in this order, each on its own ALL-CAPS heading:\n"
+    "1. A cover block naming the court/forum, the parties (with '...PETITIONER'/'...APPELLANT' "
+    "and '...RESPONDENT' style annotations) and 'MEMORANDUM ON BEHALF OF THE <SIDE>'.\n"
+    "2. TABLE OF CONTENTS — the section names only, no page numbers.\n"
+    "3. LIST OF ABBREVIATIONS — a short list of the abbreviations actually used in this memorial.\n"
+    "4. INDEX OF AUTHORITIES — cases, statutes, books and web sources actually relevant to the "
+    "facts and issues given (invent no fake citations; use well-known, plausible authorities for "
+    "the subject matter, or generic statutory references where a specific case isn't certain).\n"
+    "5. STATEMENT OF JURISDICTION — the statutory provision(s) under which this court/forum has "
+    "jurisdiction, and a short formal submission sentence.\n"
+    "6. STATEMENT OF FACTS — a clear, numbered, chronological account of the facts as given by "
+    "the user.\n"
+    "7. STATEMENT OF ISSUES — the legal issues, phrased as 'Whether ...' questions, numbered as "
+    "Issue I, Issue II, etc.\n"
+    "8. SUMMARY OF ARGUMENTS — a short paragraph per issue summarising the position taken.\n"
+    "9. ARGUMENTS ADVANCED — the substantive legal arguments, organised issue-by-issue (I., II., "
+    "...) with sub-points (A., B., ... and 1., 2., ... where useful), applying relevant statutes, "
+    "sections and case law to the facts given.\n"
+    "10. PRAYER FOR RELIEF — the specific relief sought, in the formal 'it is most humbly prayed "
+    "...' style.\n\n"
+    "The memorial must be written squarely from the standpoint of, and in the interest of, the "
+    "side specified below — its framing, emphasis and relief sought should serve that side. Use "
+    "precise, formal legal language in standard moot-memorial drafting conventions. Output ONLY "
+    "the memorial text — no commentary, notes, or explanations outside it."
+)
+
 
 TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it."
 
@@ -648,6 +793,14 @@ def stage_ask_type(conv, text):
         start_template_mode(conv)
         return
     conv["doc_type"] = stripped
+
+    if stripped == MOOT_MEMORIAL_DOC_TYPE:
+        conv["stage"] = "ask_moot_side"
+        push(conv, "assistant",
+             "Great — let's put together a moot court memorial. Which side will you be "
+             "arguing?", buttons=MOOT_SIDE_BUTTONS)
+        return
+
     conv["stage"] = "ask_facts"
     push(conv, "assistant",
          f"Got it — a {conv['doc_type']}. Click below to enter the facts and details "
@@ -735,6 +888,46 @@ def stage_ask_side(conv, text):
     push(conv, "assistant", reply_text, buttons=quick_replies)
 
 
+def _enter_brainstorm(conv):
+    """Shared tail used once side + facts are both known: kick off the opening
+    brainstorm turn and push the assistant's reply."""
+    conv["stage"] = "brainstorm"
+    try:
+        reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
+    except Exception as e:
+        reply_text, quick_replies = (
+            f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
+            f"like in the draft, or click Generate Draft when ready.", [])
+    push(conv, "assistant", reply_text, buttons=quick_replies)
+
+
+def stage_ask_moot_side(conv, text):
+    conv["side"] = text.strip()
+    conv["stage"] = "ask_moot_facts"
+    push(conv, "assistant",
+         "Got it. Click below to paste the moot proposition / problem — the court or "
+         "forum, the parties, the key facts, and the issues as framed (or however much "
+         "of it you already have).",
+         modal={"title": "Moot Problem & Facts",
+                "placeholder": "Paste the moot proposition, parties, court/forum, facts, "
+                                "and issues...",
+                "submit_label": "Save Moot Problem"})
+
+
+def stage_ask_moot_facts(conv, text):
+    conv["details"] = text.strip()
+    side_key = "petitioner" if conv["side"].lower().startswith("petitioner") else "respondent"
+    try:
+        conv["template_text"] = select_moot_reference(side_key, conv["details"])
+    except Exception as e:
+        print(f"[Moot] Template selection failed: {e}")
+        conv["template_text"] = ""
+    conv["template_source"] = ("Dratido moot-memorial structure library (internal, "
+                                "style reference only)" if conv["template_text"] else "")
+    conv["mode"] = "template"
+    _enter_brainstorm(conv)
+
+
 def stage_brainstorm(conv, text):
     conv["brainstorm"].append({"role": "user", "content": text})
     try:
@@ -753,6 +946,8 @@ STAGE_HANDLERS = {
     "ask_template":          stage_ask_template,
     "ask_template_details":  stage_ask_template_details,
     "ask_side":              stage_ask_side,
+    "ask_moot_side":         stage_ask_moot_side,
+    "ask_moot_facts":        stage_ask_moot_facts,
     "brainstorm":            stage_brainstorm,
 }
 
@@ -802,26 +997,54 @@ def _parse_brainstorm_json(raw: str):
 
 def generate_draft(conv) -> str:
     side_line = conv["side"] or "(none specified — draft in neutral, standard form for this document type)"
-    if conv["template_text"]:
-        prompt = (
-            f'Use the following as the FORMAT/STRUCTURE reference — follow its layout, clause '
-            f'structure and drafting style closely, but replace names, dates, amounts and other '
-            f'details with the DATA and brainstorm notes below. Fill in any gaps sensibly.\n\n'
-            f'--- FORMAT REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
-            f'--- DATA TO USE ---\n{conv["details"]}\n\n'
-            f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
-            f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
-            f'Now produce the complete final document text.'
-        )
+    is_moot = conv["doc_type"] == MOOT_MEMORIAL_DOC_TYPE
+
+    if is_moot:
+        system = DRAFT_SYSTEM_MOOT
+        if conv["template_text"]:
+            prompt = (
+                f'Below is a STYLE & STRUCTURE reference drawn from past moot memorials for this '
+                f'side — use it only to match section order, heading conventions, phrasing style '
+                f'and formal tone. Do NOT reuse any facts, party names, case citations, statutes '
+                f'or numbers from it — this is a DIFFERENT case with its own facts and law.\n\n'
+                f'--- STYLE & STRUCTURE REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
+                f'--- THE ACTUAL MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{conv["details"]}\n\n'
+                f'--- SIDE THIS MEMORIAL MUST ARGUE FOR ---\n{side_line}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'Now produce the complete final memorial text, following the required section '
+                f'structure exactly.'
+            )
+        else:
+            prompt = (
+                f'--- THE MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{conv["details"]}\n\n'
+                f'--- SIDE THIS MEMORIAL MUST ARGUE FOR ---\n{side_line}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'Now produce the complete final memorial text, following the required section '
+                f'structure exactly.'
+            )
     else:
-        prompt = (
-            f'Draft a "{conv["doc_type"]}" document using the following details and data:\n\n'
-            f'{conv["details"]}\n\n'
-            f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
-            f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
-            f'Produce the complete, professional, ready-to-use document text.'
-        )
-    draft_text = ai_generate(prompt, system=DRAFT_SYSTEM, temperature=0.4)
+        system = DRAFT_SYSTEM
+        if conv["template_text"]:
+            prompt = (
+                f'Use the following as the FORMAT/STRUCTURE reference — follow its layout, clause '
+                f'structure and drafting style closely, but replace names, dates, amounts and other '
+                f'details with the DATA and brainstorm notes below. Fill in any gaps sensibly.\n\n'
+                f'--- FORMAT REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
+                f'--- DATA TO USE ---\n{conv["details"]}\n\n'
+                f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'Now produce the complete final document text.'
+            )
+        else:
+            prompt = (
+                f'Draft a "{conv["doc_type"]}" document using the following details and data:\n\n'
+                f'{conv["details"]}\n\n'
+                f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'Produce the complete, professional, ready-to-use document text.'
+            )
+
+    draft_text = ai_generate(prompt, system=system, temperature=0.4)
     conv["draft_text"] = draft_text
     conv["docx_path"] = build_ai_legal_docx(conv["doc_type"] or "Legal_Draft", draft_text)
     return draft_text
