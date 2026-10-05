@@ -376,69 +376,7 @@ def select_moot_reference(side_key: str, user_text: str, profile: dict = None) -
 #  DOCX BUILDING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DRATIDO_WATERMARK_TEXT = 'Dratido - Draft Till Done'
 
-
-def add_watermark(doc, text: str = DRATIDO_WATERMARK_TEXT, preserve: bool = False):
-    """Insert a diagonal, semi-transparent watermark into the header of every
-    section (the classic Word VML watermark technique), plus a small text
-    credit line in the footer as a reliable fallback for viewers that don't
-    render VML shapes."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH as _ALIGN
-
-    safe_text = _sax.escape(text, {'"': '&quot;'})
-
-    watermark_xml = (
-        '<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:v="urn:schemas-microsoft-com:vml" '
-        'xmlns:o="urn:schemas-microsoft-com:office:office">'
-        '<v:shapetype id="_x0000_t136" coordsize="1600,21600" o:spt="136" adj="10800" '
-        'path="m@7,0l@8,0m@5,21600l@6,21600e">'
-        '<v:formulas>'
-        '<v:f eqn="sum #0 0 10800"/><v:f eqn="prod #0 2 1"/><v:f eqn="sum 21600 0 #0"/>'
-        '<v:f eqn="sum 0 0 #1"/><v:f eqn="prod #1 2 1"/><v:f eqn="sum 21600 0 #1"/>'
-        '<v:f eqn="if #0 #3 0"/><v:f eqn="if #0 21600 #1"/><v:f eqn="if #3 21600 #2"/>'
-        '<v:f eqn="if #3 #1 21600"/><v:f eqn="mid #4 #5"/><v:f eqn="mid #6 #7"/><v:f eqn="val #0"/>'
-        '</v:formulas>'
-        '<v:path textpathok="t" o:connecttype="custom" '
-        'o:connectlocs="@9,0;@10,10800;@9,21600;@8,10800" o:connectangles="270,180,90,0"/>'
-        '<v:textpath on="t" fitshape="t"/>'
-        '</v:shapetype>'
-        '<v:shape id="DratidoWatermark" o:spid="_x0000_s2049" type="#_x0000_t136" '
-        'style="position:absolute;margin-left:0;margin-top:0;width:520pt;height:110pt;'
-        'rotation:315;z-index:-251654144;mso-position-horizontal:center;'
-        'mso-position-horizontal-relative:margin;mso-position-vertical:center;'
-        'mso-position-vertical-relative:margin" o:allowincell="f" fillcolor="#8B1E2D" stroked="f">'
-        '<v:fill opacity=".18"/>'
-        f'<v:textpath style="font-family:\'Calibri\';font-size:1pt" string="{safe_text}"/>'
-        '</v:shape>'
-        '</w:pict>'
-    )
-
-    for section in doc.sections:
-        header = section.header
-        header.is_linked_to_previous = False
-        h_para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
-        if not preserve:
-            h_para.text = ''
-            h_para.alignment = _ALIGN.CENTER
-        run = h_para.add_run()
-        r_el = run._r
-        pict = parse_xml(watermark_xml)
-        r_el.append(pict)
-
-        footer = section.footer
-        footer.is_linked_to_previous = False
-        if preserve:
-            f_para = footer.add_paragraph()      # keep team code / page number paragraph intact
-        else:
-            f_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-            f_para.text = ''
-        f_para.alignment = _ALIGN.CENTER
-        f_run = f_para.add_run(text)
-        f_run.font.size = Pt(8)
-        f_run.font.color.rgb = RGBColor(0xA0, 0xA0, 0xA0)
-        f_run.italic = True
 
 
 def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
