@@ -21,203 +21,301 @@ Usage:
   python dratido_app.py
 """
 
-import os, re, time, uuid, json
+import os, re, time, uuid, json, base64, zlib, threading, traceback
+import requests
+from requests.adapters import HTTPAdapter
 from flask import Flask, request, jsonify, send_file, Response
+from werkzeug.exceptions import HTTPException
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import parse_xml
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
 
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+GENERATED_DIR = os.path.join(BASE_DIR, 'generated')
+
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024   # hard cap on any request body
 
 APP_NAME    = 'Dratido'
 APP_TAGLINE = 'Draft Till Done'
 
-# In-memory conversation store: conv_id -> conversation state (no DB, no login)
+# In-memory conversation store: conv_id -> conversation state (no DB, no login).
+# Idle conversations are evicted (see _evict_stale_conversations) so memory and the
+# generated/ folder don't grow forever on a long-running free-tier instance.
 CONVS = {}
+CONVS_LOCK = threading.Lock()
+CONV_TTL_SECONDS = 6 * 3600
+MAX_CONVS = 500
+MAX_MESSAGE_CHARS = 30000
 
 
 # ══════════════════════════════════════════════════════════════════[...]
 #  AI CLIENT  (Groq — fast free inference)
 # ══════════════════════════════════════════════════════════════════[...]
+#
+# Speed design:
+#   * one pooled HTTPS session (no TLS handshake per call)
+#   * the model list is discovered once and cached (was: an extra HTTP call per AI call)
+#   * on a 429 we fail over to the next model immediately (each Groq model has its own
+#     rate-limit bucket) instead of sleeping 4/8/16 s on the same one
+#   * small/fast model for the one-word classification call
+#   * per-call max_tokens sized to the job (a 4096 cap on a one-word answer, or on a
+#     short chat reply, wastes rate-limit budget; a 4096 cap on a full memorial truncates it)
+#   * the final draft is streamed so the user sees text within ~1 s, and is
+#     auto-continued if the model stops because it hit the token limit
+
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 
 _GROQ_PREFERRED_MODELS = [
     "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
     "openai/gpt-oss-120b",
+    "llama-3.1-8b-instant",
     "openai/gpt-oss-20b",
 ]
+_GROQ_FAST_MODELS = ["llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+_GROQ_EXCLUDED = ("whisper", "guard", "safeguard", "compound", "tts", "orpheus",
+                  "playai", "embed", "moderation")
+MAX_MODELS_TRIED = 4
+RATE_LIMIT_MAX_WAIT = 12          # seconds; longest we'll ever sleep on a 429
 
-
-def _get_groq_models(api_key, requests_module):
-    headers = {"Authorization": f"Bearer {api_key}"}
+def _int_env(name, default):
     try:
-        resp = requests_module.get(
-            "https://api.groq.com/openai/v1/models",
-            headers=headers,
-            timeout=20,
-        )
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+BRAINSTORM_MAX_TOKENS = _int_env("BRAINSTORM_MAX_TOKENS", 900)
+DRAFT_MAX_TOKENS      = _int_env("DRAFT_MAX_TOKENS", 5000)
+
+_HTTP = requests.Session()
+_HTTP.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16))
+_HTTP.mount("http://",  HTTPAdapter(pool_connections=4, pool_maxsize=16))
+
+_MODEL_CACHE = {"all": None, "available": set(), "expires": 0.0}
+_MODEL_LOCK = threading.Lock()
+
+
+def _discover_groq_models(api_key):
+    try:
+        resp = _HTTP.get(f"{GROQ_BASE_URL}/models",
+                         headers={"Authorization": f"Bearer {api_key}"}, timeout=(4, 6))
         if resp.status_code != 200:
-            return [], f"HTTP {resp.status_code} from Groq /models: {resp.text[:300]}"
+            return [], f"HTTP {resp.status_code} from Groq /models: {resp.text[:200]}"
         data = resp.json()
-        models = data.get("data", []) if isinstance(data, dict) else []
-        ids = []
-        for item in models:
-            if not isinstance(item, dict):
-                continue
-            model_id = item.get("id")
-            if model_id and item.get("active", True):
-                ids.append(model_id)
+        items = data.get("data", []) if isinstance(data, dict) else []
+        ids = [i["id"] for i in items
+               if isinstance(i, dict) and i.get("id") and i.get("active", True)]
         return ids, None
     except Exception as e:
         return [], f"Could not query Groq /models: {e}"
 
 
-def _select_groq_models(api_key, requests_module):
-    preferred_override = os.environ.get("GROQ_MODEL", "").strip()
-    available, discovery_error = _get_groq_models(api_key, requests_module)
-    available_set = set(available)
+def get_groq_models(api_key, fast=False):
+    """Ordered list of models to try. Discovery runs at most once per hour (30 s after a
+    failed discovery) instead of on every AI call."""
+    now = time.time()
+    with _MODEL_LOCK:
+        if _MODEL_CACHE["all"] is None or now > _MODEL_CACHE["expires"]:
+            available, err = _discover_groq_models(api_key)
+            if err:
+                print(f"[Groq] Model discovery warning: {err}")
+            avail_set = set(available)
+            override = os.environ.get("GROQ_MODEL", "").strip()
+            if available:
+                selected = [m for m in _GROQ_PREFERRED_MODELS if m in avail_set]
+                selected += [m for m in available
+                             if m not in selected
+                             and not any(x in m.lower() for x in _GROQ_EXCLUDED)]
+            else:
+                selected = list(_GROQ_PREFERRED_MODELS)
+            if override:
+                selected = [override] + [m for m in selected if m != override]
+            _MODEL_CACHE["all"] = list(dict.fromkeys(selected))
+            _MODEL_CACHE["available"] = avail_set
+            _MODEL_CACHE["expires"] = now + (3600 if available else 30)
+            print(f"[Groq] Models: {_MODEL_CACHE['all'][:MAX_MODELS_TRIED]}")
+        models = list(_MODEL_CACHE["all"])
+        avail = _MODEL_CACHE["available"]
 
-    if preferred_override:
-        selected = [preferred_override]
-        selected.extend(m for m in _GROQ_PREFERRED_MODELS
-                        if m != preferred_override and m in available_set)
-    elif available:
-        selected = [m for m in _GROQ_PREFERRED_MODELS if m in available_set]
-        excluded = ("whisper", "guard", "safeguard", "compound")
-        selected.extend(
-            m for m in available
-            if m not in selected and not any(x in m.lower() for x in excluded)
-        )
-    else:
-        selected = [preferred_override] if preferred_override else list(_GROQ_PREFERRED_MODELS)
-
-    return list(dict.fromkeys(selected)), discovery_error
+    if fast:
+        fast_override = os.environ.get("GROQ_FAST_MODEL", "").strip()
+        head = [fast_override] if fast_override else []
+        head += [m for m in _GROQ_FAST_MODELS if not avail or m in avail]
+        models = list(dict.fromkeys(head + models))
+    return models[:MAX_MODELS_TRIED]
 
 
-def ai_chat(messages: list, temperature: float = 0.6) -> str:
-    """Call Groq's chat-completions API with a full message list (multi-turn),
-    with model fallback + exponential backoff on 429."""
-    import requests as _req
+class _Skip(Exception):
+    """This model can't serve the request — try the next one."""
 
+class _RateLimited(Exception):
+    def __init__(self, wait):
+        super().__init__(f"rate limited, retry in {wait}s")
+        self.wait = wait
+
+
+def _retry_after(resp):
+    try:
+        return max(0.5, min(float(resp.headers.get("retry-after", "")), 60.0))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _chat_once(api_key, model, messages, temperature, max_tokens, on_text=None):
+    """One attempt against one model. Returns (text, finish_reason).
+    If on_text is given the response is streamed and on_text(accumulated_text) is called
+    as tokens arrive."""
+    stream = on_text is not None
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_completion_tokens": max_tokens,
+        "stream": stream,
+    }
+    if model.startswith("openai/gpt-oss"):
+        payload["reasoning_effort"] = "low"     # reasoning tokens are pure latency here
+
+    try:
+        resp = _HTTP.post(f"{GROQ_BASE_URL}/chat/completions",
+                          headers={"Authorization": f"Bearer {api_key}",
+                                   "Content-Type": "application/json"},
+                          json=payload, timeout=(5, 60), stream=stream)
+    except requests.exceptions.Timeout:
+        raise _Skip(f"Timeout on {model}")
+    except requests.exceptions.RequestException as e:
+        raise _Skip(f"Request error on {model}: {e}")
+
+    try:
+        if resp.status_code == 429:
+            raise _RateLimited(_retry_after(resp))
+        if resp.status_code != 200:
+            raise _Skip(f"HTTP {resp.status_code} on {model}: {resp.text[:200]}")
+
+        finish = None
+        if not stream:
+            try:
+                data = resp.json()
+                if "error" in data:
+                    raise _Skip(f"API error on {model}: {data['error']}")
+                choice = data["choices"][0]
+                text = choice["message"]["content"] or ""
+                finish = choice.get("finish_reason")
+            except _Skip:
+                raise
+            except Exception as e:
+                raise _Skip(f"Unexpected response from {model}: {e}")
+        else:
+            acc = ""
+            for raw in resp.iter_lines():
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "replace")
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(body)
+                except ValueError:
+                    continue
+                if "error" in evt:
+                    raise _Skip(f"Stream error on {model}: {evt['error']}")
+                ch = (evt.get("choices") or [{}])[0]
+                delta = (ch.get("delta") or {}).get("content")
+                if delta:
+                    acc += delta
+                    on_text(acc)
+                if ch.get("finish_reason"):
+                    finish = ch["finish_reason"]
+            text = acc
+    except requests.exceptions.RequestException as e:
+        raise _Skip(f"Connection dropped on {model}: {e}")
+    finally:
+        resp.close()
+
+    if not text.strip():
+        raise _Skip(f"Empty content from {model}")
+    return text, finish
+
+
+def _chat_with_failover(api_key, models, messages, temperature, max_tokens, on_text=None):
+    last_error = None
+    for rnd in range(2):
+        min_wait = None
+        for model in models:
+            try:
+                text, finish = _chat_once(api_key, model, messages, temperature,
+                                          max_tokens, on_text)
+                print(f"[Groq] ✓ {model} ({len(text)} chars, finish={finish})")
+                return text, finish, model
+            except _RateLimited as e:
+                last_error = f"429 rate-limited on {model}"
+                min_wait = e.wait if min_wait is None else min(min_wait, e.wait)
+                print(f"[Groq] {last_error} — trying next model")
+            except _Skip as e:
+                last_error = str(e)
+                print(f"[Groq] {last_error[:160]} — trying next model")
+        # Every model failed. Only worth a second pass if the cause was rate limiting.
+        if min_wait is None or rnd == 1:
+            break
+        time.sleep(min(min_wait, RATE_LIMIT_MAX_WAIT))
+    raise RuntimeError(f"All Groq models failed. Last error: {last_error}")
+
+
+def ai_chat(messages: list, temperature: float = 0.6, max_tokens: int = BRAINSTORM_MAX_TOKENS,
+            fast: bool = False, on_text=None, max_continuations: int = 0) -> str:
+    """Call Groq's chat-completions API (multi-turn) with model failover.
+
+    fast=True              prefers the small/fast models (classification, short answers)
+    on_text(text)          streams the response; called with the text so far
+    max_continuations=N    if the model stops because it hit max_tokens, ask it to carry
+                           on (up to N times) so long documents are never silently cut off
+    """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY not set. Get a free key at https://console.groq.com")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
+    models = get_groq_models(api_key, fast=fast)
+    if not models:
+        raise RuntimeError("No active Groq text models are available to this API key/project.")
 
-    _GROQ_MODELS, discovery_error = _select_groq_models(api_key, _req)
-    print(f"[Groq] Models selected for this key/project: {_GROQ_MODELS}")
-    if discovery_error:
-        print(f"[Groq] Model discovery warning: {discovery_error}")
-    if not _GROQ_MODELS:
-        raise RuntimeError(
-            "No active Groq text models are available to this API key/project. "
-            "Check Groq Project > Settings > Limits/Model Permissions and API key."
-        )
-
-    last_error = None
-
-    for model in _GROQ_MODELS:
-        payload = {
-            "model":       model,
-            "messages":    messages,
-            "temperature": temperature,
-            "max_completion_tokens": 4096,
-            "stream":      False,
-        }
-
-        for attempt in range(3):
-            try:
-                resp = _req.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=90,
-                )
-            except _req.exceptions.Timeout:
-                last_error = f"Timeout on {model}"
-                print(f"[Groq] Timeout on {model}, trying next...")
-                break
-            except _req.exceptions.RequestException as e:
-                last_error = f"Request error on {model}: {e}"
-                print(f"[Groq] {last_error}")
-                break
-
-            status = resp.status_code
-
-            if status == 429:
-                wait = 2 ** (attempt + 2)
-                last_error = f"429 rate-limited on {model} (attempt {attempt+1})"
-                print(f"[Groq] 429 on {model}, waiting {wait}s...")
-                time.sleep(wait)
-                continue
-
-            if status in (400, 402, 404, 503):
-                body = resp.text[:300]
-                last_error = f"HTTP {status} on {model}: {body}"
-                print(f"[Groq] {status} on {model} (skipping): {body[:120]}")
-                break
-
-            if status != 200:
-                last_error = f"HTTP {status} on {model}: {resp.text[:300]}"
-                print(f"[Groq] Unexpected {status} on {model}: {resp.text[:120]}")
-                break
-
-            try:
-                data = resp.json()
-            except Exception as e:
-                last_error = f"JSON parse error on {model}: {e}"
-                print(f"[Groq] {last_error}")
-                break
-
-            if "error" in data:
-                err = data["error"]
-                last_error = f"API error on {model}: {err}"
-                print(f"[Groq] {last_error}")
-                err_str = str(err).lower()
-                if "rate" in err_str or "quota" in err_str or "limit" in err_str:
-                    wait = 2 ** (attempt + 2)
-                    print(f"[Groq] Quota error, waiting {wait}s...")
-                    time.sleep(wait)
-                    continue
-                break
-
-            try:
-                text = (data["choices"][0]["message"]["content"] or "").strip()
-            except (KeyError, IndexError, TypeError) as e:
-                last_error = f"Unexpected shape from {model}: {e}"
-                print(f"[Groq] {last_error}")
-                break
-
-            if not text:
-                last_error = f"Empty content from {model}"
-                print(f"[Groq] {last_error}")
-                break
-
-            print(f"[Groq] ✓ {model} ({len(text)} chars)")
-            return text
-
-        time.sleep(1)
-
-    raise RuntimeError(
-        f"All accessible Groq models failed. Last error: {last_error}. "
-        "The application queried Groq /models first, so this error now reflects "
-        "models visible to your current API key/project. Check Groq Project "
-        "model permissions and API key at https://console.groq.com"
-    )
+    text, finish, used = _chat_with_failover(api_key, models, messages, temperature,
+                                             max_tokens, on_text)
+    for _ in range(max_continuations):
+        if finish != "length":
+            break
+        print("[Groq] Output hit the token limit — requesting continuation")
+        order = [used] + [m for m in models if m != used]
+        cont_msgs = messages + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content":
+                "Continue the document exactly where you stopped. Do not repeat anything "
+                "already written, and do not add commentary — output only the continuation."},
+        ]
+        prefix = text
+        cb = (lambda t, _p=prefix: on_text(_p + t)) if on_text else None
+        try:
+            more, finish, used = _chat_with_failover(api_key, order, cont_msgs, temperature,
+                                                     max_tokens, cb)
+        except RuntimeError as e:
+            print(f"[Groq] Continuation failed, returning partial text: {e}")
+            break
+        text += more
+    return text.strip()
 
 
-def ai_generate(prompt: str, system: str = "", temperature: float = 0.6) -> str:
+def ai_generate(prompt: str, system: str = "", temperature: float = 0.6, **kw) -> str:
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    return ai_chat(messages, temperature=temperature)
+    return ai_chat(messages, temperature=temperature, **kw)
 
 
 # ══════════════════════════════════════════════════════════════════[...]
@@ -228,19 +326,44 @@ ALLOWED_TEMPLATE_EXTENSIONS = {'.docx', '.pdf'}
 MAX_TEMPLATE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
 
 
+MAX_TEMPLATE_CHARS = 20000   # the draft prompt only uses the first ~6000; no point reading 200 pages
+
+
+def _iter_block_items(doc):
+    """Yield paragraphs and tables in true document order."""
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn('w:p'):
+            yield Paragraph(child, doc)
+        elif child.tag == qn('w:tbl'):
+            yield Table(child, doc)
+
+
 def extract_text_from_docx(file_stream) -> str:
     """Pull readable text (paragraphs + table cells, in document order) out of an
     uploaded .docx reference template."""
     doc = Document(file_stream)
-    parts = []
-    for para in doc.paragraphs:
-        if para.text.strip():
-            parts.append(para.text.strip())
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                parts.append('\t'.join(cells))
+    parts, total = [], 0
+    for block in _iter_block_items(doc):
+        if isinstance(block, Paragraph):
+            t = block.text.strip()
+            if t:
+                parts.append(t)
+                total += len(t)
+        else:
+            for row in block.rows:
+                seen, cells = set(), []
+                for c in row.cells:
+                    if c._tc in seen:          # merged cells are returned once per grid column
+                        continue
+                    seen.add(c._tc)
+                    if c.text.strip():
+                        cells.append(c.text.strip())
+                if cells:
+                    line = '\t'.join(cells)
+                    parts.append(line)
+                    total += len(line)
+        if total >= MAX_TEMPLATE_CHARS:
+            break
     return '\n'.join(parts).strip()
 
 
@@ -251,14 +374,19 @@ def extract_text_from_pdf(file_stream) -> str:
     reader = PdfReader(file_stream)
     if getattr(reader, "is_encrypted", False):
         try:
-            reader.decrypt('')
+            ok = reader.decrypt('')
         except Exception:
-            pass
-    parts = []
-    for page in reader.pages:
+            ok = 0
+        if not ok:
+            raise ValueError("PDF is password-protected")
+    parts, total = [], 0
+    for page in reader.pages[:60]:
         text = (page.extract_text() or '').strip()
         if text:
             parts.append(text)
+            total += len(text)
+            if total >= MAX_TEMPLATE_CHARS:
+                break
     return '\n\n'.join(parts).strip()
 
 
@@ -294,7 +422,7 @@ def _moot_fernet():
 
     passphrase = os.environ.get("MOOT_TEMPLATE_PASSPHRASE", "").strip() or _MOOT_DEFAULT_PASSPHRASE
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=_MOOT_FIXED_SALT, iterations=200_000)
-    key = __import__('base64').urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
+    key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
     return Fernet(key)
 
 
@@ -315,7 +443,6 @@ def load_moot_templates():
         with open(MOOT_TEMPLATES_FILE, 'rb') as f:
             token = f.read()
         compressed = _moot_fernet().decrypt(token)
-        import zlib
         raw = zlib.decompress(compressed)
         _moot_templates_cache = json.loads(raw.decode('utf-8'))
         print(f"[Moot] Loaded {len(_moot_templates_cache)} moot-memorial style templates")
@@ -351,16 +478,21 @@ def select_moot_reference(side_key: str, user_text: str) -> str:
 
     matching = [t for t in templates if t.get("side") == side_key] or templates
 
+    def _completeness(t):
+        return sum(1 for k in ("abbreviations_sample", "authorities_style", "jurisdiction_example",
+                               "issues_style", "arguments_style", "prayer_example")
+                   if (t.get(k) or "").strip())
+
     user_words = set(re.findall(r'[a-zA-Z]{4,}', (user_text or "").lower()))
     if not user_words:
-        chosen = matching[0]
+        chosen = max(matching, key=_completeness)
     else:
         def _score(t):
             blob = ' '.join([t.get('court', ''), t.get('parties', ''),
                               t.get('issues_style', ''), t.get('arguments_style', '')]).lower()
             blob_words = set(re.findall(r'[a-zA-Z]{4,}', blob))
             return len(user_words & blob_words)
-        chosen = max(matching, key=_score)
+        chosen = max(matching, key=lambda t: (_score(t), _completeness(t)))
 
     return _format_moot_reference(chosen)
 
@@ -368,6 +500,39 @@ def select_moot_reference(side_key: str, user_text: str) -> str:
 # ══════════════════════════════════════════════════════════════════[...]
 #  DOCX BUILDING
 # ══════════════════════════════════════════════════════════════════[...]
+
+
+_TNR = 'Times New Roman'
+_NUMBERED_RE = re.compile(r'^\s*(\d{1,3})[\.\)]\s+(.*)$')
+_BULLET_RE   = re.compile(r'^(?:[-•\u2022]|\*(?!\*))\s+(.*)$')
+_SUBITEM_RE  = re.compile(r'^\(?([a-zA-Z]|[ivxIVX]{1,5}|\d{1,2})\)\s+(.*)$')
+_RULE_RE     = re.compile(r'^(?:-{3,}|\*{3,}|={3,}|`{3,}.*)$')   # markdown rules / code fences
+_INLINE_RE   = re.compile(r'(\*\*[^*\n]+?\*\*|(?<![*\w])\*[^*\s][^*\n]*?\*(?![*\w]))')
+
+
+def _style_run(run, size=12, bold=None, italic=None):
+    run.font.name = _TNR
+    run.font.size = Pt(size)
+    if bold:
+        run.bold = True
+    if italic:
+        run.italic = True
+
+
+def _add_runs(p, text, size=12, bold=False):
+    """Add text to a paragraph, turning **bold** / *italic* markdown into real formatting
+    (models emit it even when told not to) and dropping any stray asterisks."""
+    for part in _INLINE_RE.split(text):
+        if not part:
+            continue
+        b, it = bold, False
+        if part.startswith('**') and part.endswith('**') and len(part) > 4:
+            part, b = part[2:-2], True
+        elif part.startswith('*') and part.endswith('*') and len(part) > 2:
+            part, it = part[1:-1], True
+        part = part.replace('**', '')
+        if part:
+            _style_run(p.add_run(part), size=size, bold=b, italic=it)
 
 
 def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
@@ -382,62 +547,83 @@ def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
         sec.left_margin   = Inches(1.25)
         sec.right_margin  = Inches(1.25)
 
-    TNR = 'Times New Roman'
-    lines = [ln.rstrip() for ln in ai_text.strip().split('\n')]
+    normal = doc.styles['Normal']
+    normal.font.name = _TNR
+    normal.font.size = Pt(12)
+    normal.element.rPr.rFonts.set(qn('w:eastAsia'), _TNR)
 
-    numbered_re   = re.compile(r'^\s*(\d{1,3})[\.\)]\s+(.*)$')
     title_written = False
 
-    for ln in lines:
+    for ln in ai_text.strip().split('\n'):
         stripped = ln.strip()
-        if not stripped:
+        if not stripped or _RULE_RE.match(stripped):
             continue
-        clean = stripped.strip('#').strip()
-        clean = re.sub(r'^\*\*(.*)\*\*$', r'\1', clean).strip()
-        clean = clean.lstrip('*').strip()
+        clean = re.sub(r'^#{1,6}\s*', '', stripped)
+        clean = re.sub(r'\s+#{2,}$', '', clean).strip()
+        whole_bold = re.fullmatch(r'\*\*(.+?)\*\*', clean)
+        if whole_bold:
+            clean = whole_bold.group(1).strip()
         if not clean:
             continue
 
-        m = numbered_re.match(clean)
-        if not title_written and not m:
+        m_num = _NUMBERED_RE.match(clean)
+        m_bul = None if m_num else _BULLET_RE.match(clean)
+        m_sub = None if (m_num or m_bul) else _SUBITEM_RE.match(clean)
+
+        if not title_written and not m_num and not m_bul:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.paragraph_format.space_after = Pt(16)
-            r = p.add_run(clean.upper())
-            r.bold = True; r.font.size = Pt(16); r.font.name = TNR
+            _add_runs(p, clean.upper().replace('**', ''), size=16, bold=True)
             title_written = True
-            continue
 
-        if m:
-            num, body = m.group(1), m.group(2)
+        elif m_num:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             p.paragraph_format.space_before = Pt(4)
             p.paragraph_format.space_after  = Pt(4)
             p.paragraph_format.left_indent  = Inches(0.5)
             p.paragraph_format.first_line_indent = Inches(-0.5)
-            r_num = p.add_run(f'{num}.  ')
-            r_num.bold = True; r_num.font.size = Pt(12); r_num.font.name = TNR
-            r_body = p.add_run(body)
-            r_body.font.size = Pt(12); r_body.font.name = TNR
-        elif clean.isupper() and len(clean) < 80:
+            _style_run(p.add_run(f'{m_num.group(1)}.  '), bold=True)
+            _add_runs(p, m_num.group(2))
+
+        elif m_bul:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after  = Pt(2)
+            p.paragraph_format.left_indent  = Inches(0.75)
+            p.paragraph_format.first_line_indent = Inches(-0.25)
+            _style_run(p.add_run('•  '))
+            _add_runs(p, m_bul.group(1))
+
+        elif m_sub:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.space_before = Pt(3)
+            p.paragraph_format.space_after  = Pt(3)
+            p.paragraph_format.left_indent  = Inches(0.9)
+            p.paragraph_format.first_line_indent = Inches(-0.4)
+            _style_run(p.add_run(f'({m_sub.group(1)})  '))
+            _add_runs(p, m_sub.group(2))
+
+        elif clean.replace('**', '').isupper() and len(clean) < 80:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.paragraph_format.space_before = Pt(10)
             p.paragraph_format.space_after  = Pt(8)
-            r = p.add_run(clean)
-            r.bold = True; r.font.size = Pt(13); r.font.name = TNR
+            _add_runs(p, clean.replace('**', ''), size=13, bold=True)
+
         else:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             p.paragraph_format.space_before = Pt(6)
             p.paragraph_format.space_after  = Pt(6)
-            r = p.add_run(clean)
-            r.font.size = Pt(12); r.font.name = TNR
+            _add_runs(p, clean)
 
-    os.makedirs('generated', exist_ok=True)
+    os.makedirs(GENERATED_DIR, exist_ok=True)
     safe = re.sub(r'[^\w\-]', '_', (doc_type or 'Legal_Draft')[:40]) or 'Legal_Draft'
-    out  = os.path.abspath(f'generated/{safe}_{uuid.uuid4().hex[:8]}.docx')
+    out  = os.path.join(GENERATED_DIR, f'{safe}_{uuid.uuid4().hex[:8]}.docx')
     doc.save(out)
     return out
 
@@ -555,7 +741,34 @@ WELCOME_MSG = (
 )
 
 
+def _remove_file(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _evict_stale_conversations():
+    """Drop idle conversations (and their .docx files) so the process doesn't leak."""
+    now = time.time()
+    with CONVS_LOCK:
+        def running(c):
+            j = c.get("job")
+            return bool(j and j.get("status") == "running")
+        stale = [cid for cid, c in CONVS.items()
+                 if now - c["touched"] > CONV_TTL_SECONDS and not running(c)]
+        overflow = len(CONVS) - len(stale) - MAX_CONVS
+        if overflow > 0:
+            by_age = sorted((c["touched"], cid) for cid, c in CONVS.items()
+                            if cid not in stale and not running(c))
+            stale += [cid for _, cid in by_age[:overflow]]
+        for cid in stale:
+            _remove_file(CONVS.pop(cid).get("docx_path"))
+
+
 def new_conversation() -> dict:
+    _evict_stale_conversations()
     conv_id = uuid.uuid4().hex
     conv = {
         "id": conv_id,
@@ -570,13 +783,20 @@ def new_conversation() -> dict:
         "brainstorm": [],      # {role, content} sent to the LLM during brainstorming
         "draft_text": "",
         "docx_path": "",
+        "job": None,           # background draft-generation job, if any
+        "lock": threading.RLock(),   # serialises requests for one conversation
+        "touched": time.time(),
     }
-    CONVS[conv_id] = conv
+    with CONVS_LOCK:
+        CONVS[conv_id] = conv
     return conv
 
 
 def get_conversation(conv_id: str):
-    return CONVS.get(conv_id)
+    conv = CONVS.get(conv_id)
+    if conv:
+        conv["touched"] = time.time()
+    return conv
 
 
 def push(conv, role, content, buttons=None, modal=None):
@@ -768,9 +988,39 @@ def stage_ask_template_details(conv, text):
     decide_side_stage(conv)
 
 
+# Whether a document type needs "which side does this favour?" is decided locally for every
+# type in the built-in list (instant, free, deterministic). Only free-typed document types and
+# template-only drafts fall through to the AI classifier.
+_ADVERSARIAL_GROUPS = {"Notices & Replies", "Civil Pleadings", "Criminal Matters (BNS, BNSS & BSA)",
+                       "Writs & Constitutional", "Consumer & Labour", "Family Law"}
+_NEUTRAL_GROUPS = {"Affidavits & Declarations", "Agreements & Contracts",
+                   "Property & Real Estate", "Corporate & Commercial"}
+_SIDE_OVERRIDES = {
+    "Application under RTI Act": False,
+    "Divorce Petition (Mutual Consent)": False, "Adoption Deed": False,
+    "Will / Testament": False, "Declaration of Marriage": False,
+    "Undertaking": False, "Indemnity Letter": False, "Authorization Letter": False,
+    "Deed of Assignment": False, "Statement of Case": True,
+}
+_SIDE_BY_TYPE = {}
+for _g in DOCUMENT_TYPES:
+    for _item in _g["items"]:
+        if _g["group"] in _ADVERSARIAL_GROUPS:
+            _SIDE_BY_TYPE[_item] = True
+        elif _g["group"] in _NEUTRAL_GROUPS:
+            _SIDE_BY_TYPE[_item] = False
+_SIDE_BY_TYPE.update(_SIDE_OVERRIDES)
+
+SIDE_OTHER_VALUE = SIDE_BUTTONS[2]["value"]
+
+
 def needs_side_question(conv) -> bool:
-    """Ask the AI pipeline whether this document type is inherently adversarial (so a
-    favoured side needs to be picked) or neutral/bilateral (so the question can be skipped)."""
+    """Is this document inherently adversarial (so a favoured side must be picked) or
+    neutral/bilateral (so the question can be skipped)?"""
+    known = _SIDE_BY_TYPE.get(conv["doc_type"])
+    if known is not None:
+        return known
+
     doc_type = conv["doc_type"] or "(unspecified — inferred from the reference template)"
     context = (conv["template_text"] or conv["details"])[:1500]
     prompt = (
@@ -783,14 +1033,35 @@ def needs_side_question(conv) -> bool:
         'declaration — where no single side needs to be favoured?\n'
         'Reply with exactly one word: YES or NO.'
     )
-    answer = ai_generate(prompt, temperature=0).strip().upper()
-    return answer.startswith("Y")
+    answer = ai_generate(prompt, temperature=0, fast=True, max_tokens=16).strip().upper()
+    if answer.startswith("N"):
+        return False
+    return True      # YES, or anything unclear -> ask; asking is the safe default
+
+
+def _ai_unavailable_note(e, retry_hint):
+    msg = str(e).strip().replace("\n", " ")
+    if len(msg) > 220:
+        msg = msg[:220] + "…"
+    return f"(AI is temporarily unavailable: {msg}) {retry_hint}"
+
+
+def _enter_brainstorm(conv):
+    """Shared tail used once side + facts are both known: kick off the opening
+    brainstorm turn and push the assistant's reply."""
+    conv["stage"] = "brainstorm"
+    try:
+        reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
+    except Exception as e:
+        reply_text, quick_replies = (
+            _ai_unavailable_note(e, "You can still describe what you'd like in the draft, "
+                                    "or click Generate Draft when ready."), [])
+    push(conv, "assistant", reply_text, buttons=quick_replies)
 
 
 def decide_side_stage(conv):
-    """After facts/data are collected, decide — via the AI pipeline — whether asking which
-    side the draft should favour is actually relevant, and either ask it or skip straight
-    to the brainstorm."""
+    """After facts/data are collected, decide whether asking which side the draft should
+    favour is actually relevant, and either ask it or skip straight to the brainstorm."""
     try:
         needs_side = needs_side_question(conv)
     except Exception:
@@ -803,39 +1074,18 @@ def decide_side_stage(conv):
              "or enforce?", buttons=SIDE_BUTTONS)
     else:
         conv["side"] = ""
-        conv["stage"] = "brainstorm"
-        try:
-            reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
-        except Exception as e:
-            reply_text, quick_replies = (
-                f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
-                f"like in the draft, or click Generate Draft when ready.", [])
-        push(conv, "assistant", reply_text, buttons=quick_replies)
+        _enter_brainstorm(conv)
 
 
 def stage_ask_side(conv, text):
+    if text.strip() == SIDE_OTHER_VALUE:
+        # "Other — I'll specify": actually ask who, instead of storing the button label as the side.
+        push(conv, "assistant",
+             "Sure — who should this draft favour? Type the party's name or role "
+             "(for example, \"the landlord\" or \"the complainant\").")
+        return    # stay in ask_side
     conv["side"] = text.strip()
-    conv["stage"] = "brainstorm"
-    try:
-        reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
-    except Exception as e:
-        reply_text, quick_replies = (
-            f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
-            f"like in the draft, or click Generate Draft when ready.", [])
-    push(conv, "assistant", reply_text, buttons=quick_replies)
-
-
-def _enter_brainstorm(conv):
-    """Shared tail used once side + facts are both known: kick off the opening
-    brainstorm turn and push the assistant's reply."""
-    conv["stage"] = "brainstorm"
-    try:
-        reply_text, quick_replies = run_brainstorm_turn(conv, opening=True)
-    except Exception as e:
-        reply_text, quick_replies = (
-            f"(AI is temporarily unavailable: {e}) You can still describe what you'd "
-            f"like in the draft, or click Generate Draft when ready.", [])
-    push(conv, "assistant", reply_text, buttons=quick_replies)
+    _enter_brainstorm(conv)
 
 
 def stage_ask_moot_side(conv, text):
@@ -853,7 +1103,9 @@ def stage_ask_moot_side(conv, text):
 
 def stage_ask_moot_facts(conv, text):
     conv["details"] = text.strip()
-    side_key = "petitioner" if conv["side"].lower().startswith("petitioner") else "respondent"
+    side_key = ("respondent"
+                if re.search(r'respondent|defendant|opposite part', conv["side"], re.I)
+                else "petitioner")
     try:
         conv["template_text"] = select_moot_reference(side_key, conv["details"])
     except Exception as e:
@@ -904,37 +1156,61 @@ def run_brainstorm_turn(conv, opening=False):
         messages.append({"role": "user", "content":
             "Kick off the brainstorm: briefly note how you'll approach this draft, and ask "
             "1-2 short questions if anything important is still missing."})
-    raw = ai_chat(messages, temperature=0.6)
+    raw = ai_chat(messages, temperature=0.6, max_tokens=BRAINSTORM_MAX_TOKENS)
     reply_text, quick_replies = _parse_brainstorm_json(raw)
     conv["brainstorm"].append({"role": "assistant", "content": reply_text})
     return reply_text, quick_replies
 
 
+def _clean_quick_replies(raw_quick):
+    out = []
+    if isinstance(raw_quick, list):
+        for item in raw_quick[:4]:
+            if isinstance(item, dict) and item.get("label") and item.get("value"):
+                out.append({"label": str(item["label"])[:40], "value": str(item["value"])})
+    return out
+
+
 def _parse_brainstorm_json(raw: str):
-    """Best-effort parse of the model's structured {reply, quick_replies} JSON. Falls back
-    to treating the raw text as the reply (with no quick-reply buttons) if parsing fails."""
+    """Best-effort parse of the model's structured {reply, quick_replies} JSON. Handles
+    code fences, chatter around the object, and replies cut off mid-JSON by the token
+    limit; falls back to the raw text (no buttons) so users never see broken JSON."""
     text = raw.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text)
     text = re.sub(r'\s*```$', '', text)
+
+    data = None
     try:
         data = json.loads(text)
-        reply = str(data.get("reply", "")).strip() or raw.strip()
-        raw_quick = data.get("quick_replies") or []
-        quick_replies = []
-        for item in raw_quick[:4]:
-            if isinstance(item, dict) and item.get("label") and item.get("value"):
-                quick_replies.append({
-                    "label": str(item["label"])[:40],
-                    "value": str(item["value"]),
-                })
-        return reply, quick_replies
-    except Exception:
-        return raw.strip(), []
+    except ValueError:
+        s, e = text.find('{'), text.rfind('}')
+        if s != -1 and e > s:
+            try:
+                data = json.loads(text[s:e + 1])
+            except ValueError:
+                data = None
+
+    if isinstance(data, dict):
+        reply = str(data.get("reply", "")).strip()
+        if reply:
+            return reply, _clean_quick_replies(data.get("quick_replies"))
+
+    m = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)', text, re.S)   # truncated JSON
+    if m:
+        frag = m.group(1)
+        try:
+            return json.loads('"' + frag + '"').strip(), []
+        except ValueError:
+            return frag.replace('\\n', '\n').replace('\\"', '"').strip(), []
+    return raw.strip(), []
 
 
-def generate_draft(conv) -> str:
+def build_draft_prompt(conv):
+    """Return (system, prompt) for the final draft."""
     side_line = conv["side"] or "(none specified — draft in neutral, standard form for this document type)"
     is_moot = conv["doc_type"] == MOOT_MEMORIAL_DOC_TYPE
+    details = conv["details"][:12000]
+    notes = _digest(conv)
 
     if is_moot:
         system = DRAFT_SYSTEM_MOOT
@@ -945,17 +1221,17 @@ def generate_draft(conv) -> str:
                 f'and formal tone. Do NOT reuse any facts, party names, case citations, statutes '
                 f'or numbers from it — this is a DIFFERENT case with its own facts and law.\n\n'
                 f'--- STYLE & STRUCTURE REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
-                f'--- THE ACTUAL MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{conv["details"]}\n\n'
+                f'--- THE ACTUAL MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{details}\n\n'
                 f'--- SIDE THIS MEMORIAL MUST ARGUE FOR ---\n{side_line}\n\n'
-                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{notes}\n\n'
                 f'Now produce the complete final memorial text, following the required section '
                 f'structure exactly.'
             )
         else:
             prompt = (
-                f'--- THE MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{conv["details"]}\n\n'
+                f'--- THE MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{details}\n\n'
                 f'--- SIDE THIS MEMORIAL MUST ARGUE FOR ---\n{side_line}\n\n'
-                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{notes}\n\n'
                 f'Now produce the complete final memorial text, following the required section '
                 f'structure exactly.'
             )
@@ -967,24 +1243,73 @@ def generate_draft(conv) -> str:
                 f'structure and drafting style closely, but replace names, dates, amounts and other '
                 f'details with the DATA and brainstorm notes below. Fill in any gaps sensibly.\n\n'
                 f'--- FORMAT REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
-                f'--- DATA TO USE ---\n{conv["details"]}\n\n'
+                f'--- DATA TO USE ---\n{details}\n\n'
                 f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
-                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{notes}\n\n'
                 f'Now produce the complete final document text.'
             )
         else:
             prompt = (
                 f'Draft a "{conv["doc_type"]}" document using the following details and data:\n\n'
-                f'{conv["details"]}\n\n'
+                f'{details}\n\n'
                 f'--- SIDE THIS MUST FAVOUR ---\n{side_line}\n\n'
-                f'--- BRAINSTORM NOTES ---\n{_digest(conv)}\n\n'
+                f'--- BRAINSTORM NOTES ---\n{notes}\n\n'
                 f'Produce the complete, professional, ready-to-use document text.'
             )
+    return system, prompt
 
-    draft_text = ai_generate(prompt, system=system, temperature=0.4)
-    conv["draft_text"] = draft_text
-    conv["docx_path"] = build_ai_legal_docx(conv["doc_type"] or "Legal_Draft", draft_text)
-    return draft_text
+
+def _clean_draft(text: str) -> str:
+    """Strip code fences a model sometimes wraps around the document."""
+    text = re.sub(r'^\s*```[a-zA-Z]*\s*\n', '', text)
+    text = re.sub(r'\n\s*```\s*$', '', text)
+    return text.strip()
+
+
+DRAFT_READY_NOTE = ("Here's a draft based on everything we've discussed. Review it in the side "
+                    "panel, and keep chatting if you'd like changes — you can regenerate any time.")
+
+
+def _run_generation_job(conv, job, system, prompt):
+    """Background worker: streams the draft into job['text'] so the UI can show it live,
+    then builds the .docx. Runs in a thread so no HTTP request is held open for the
+    whole generation (Render's proxy would cut a long request)."""
+    try:
+        def on_text(t):
+            job["text"] = t
+
+        text = ai_generate(prompt, system=system, temperature=0.4,
+                           max_tokens=DRAFT_MAX_TOKENS, on_text=on_text, max_continuations=2)
+        text = _clean_draft(text)
+        job["text"] = text
+
+        try:
+            path = build_ai_legal_docx(conv["doc_type"] or "Legal_Draft", text)
+        except Exception:
+            traceback.print_exc()
+            path = ""
+
+        with conv["lock"]:
+            old = conv.get("docx_path")
+            conv["draft_text"] = text
+            conv["docx_path"] = path
+            if old and old != path:
+                _remove_file(old)
+            push(conv, "assistant", DRAFT_READY_NOTE if path else
+                 DRAFT_READY_NOTE + " (The Word export failed this time — regenerate to retry.)")
+        job["status"] = "done"
+    except Exception as e:
+        traceback.print_exc()
+        job["error"] = str(e)[:400] or "Draft generation failed."
+        job["status"] = "error"
+
+
+def _digest(conv, limit_chars=3000):
+    parts = []
+    for m in conv["brainstorm"][-16:]:
+        parts.append(f'{m["role"].upper()}: {m["content"]}')
+    text = "\n".join(parts)
+    return text[-limit_chars:] if text else "(no additional notes)"
 
 
 def _digest(conv, limit_chars=3000):
@@ -998,6 +1323,27 @@ def _digest(conv, limit_chars=3000):
 # ══════════════════════════════════════════════════════════════════[...]
 #  ROUTES
 # ══════════════════════════════════════════════════════════════════[...]
+
+@app.errorhandler(413)
+def _too_large(e):
+    return jsonify({"success": False, "message": "That upload is too large (max 15 MB)."}), 413
+
+
+@app.errorhandler(Exception)
+def _handle_error(e):
+    """Always answer the JS client with JSON — a bare HTML 500 page used to leave the UI
+    stuck on 'Dratido is thinking…'."""
+    if isinstance(e, HTTPException):
+        return jsonify({"success": False, "message": e.description or e.name}), e.code
+    traceback.print_exc()
+    return jsonify({"success": False,
+                    "message": "Something went wrong on the server. Please try again."}), 500
+
+
+@app.route('/healthz')
+def healthz():
+    return "ok", 200
+
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
@@ -1016,20 +1362,22 @@ def api_message():
         return jsonify({"success": False, "message": "Conversation not found. Start a new draft."}), 404
     if not text:
         return jsonify({"success": False, "message": "Please enter a message."}), 400
+    if len(text) > MAX_MESSAGE_CHARS:
+        return jsonify({"success": False,
+                        "message": f"That message is too long (max {MAX_MESSAGE_CHARS:,} characters)."}), 400
 
-    push(conv, "user", text)
-
-    handler = STAGE_HANDLERS.get(conv["stage"])
-    if not handler:
-        return jsonify({"success": False, "message": "Unknown stage."}), 400
-    handler(conv, text)
-
-    return jsonify({
-        "success": True,
-        "messages": conv["messages"],
-        "stage": conv["stage"],
-        "can_generate": conv["stage"] == "brainstorm",
-    })
+    with conv["lock"]:      # one request at a time per conversation (double-clicks, retries)
+        handler = STAGE_HANDLERS.get(conv["stage"])
+        if not handler:
+            return jsonify({"success": False, "message": "Unknown stage."}), 400
+        push(conv, "user", text)
+        handler(conv, text)
+        return jsonify({
+            "success": True,
+            "messages": conv["messages"],
+            "stage": conv["stage"],
+            "can_generate": conv["stage"] == "brainstorm",
+        })
 
 
 @app.route('/api/upload_template', methods=['POST'])
@@ -1038,8 +1386,6 @@ def api_upload_template():
     conv = get_conversation(conv_id)
     if not conv:
         return jsonify({"success": False, "message": "Conversation not found. Start a new draft."}), 404
-    if conv["stage"] != "ask_template":
-        return jsonify({"success": False, "message": "Not expecting a template upload right now."}), 400
 
     f = request.files.get('file')
     if not f or not f.filename:
@@ -1058,69 +1404,93 @@ def api_upload_template():
     if size > MAX_TEMPLATE_UPLOAD_BYTES:
         return jsonify({"success": False, "message": "That file is too large (max 15 MB)."}), 400
 
-    try:
-        if ext == '.docx':
-            extracted = extract_text_from_docx(f.stream)
-        else:
-            extracted = extract_text_from_pdf(f.stream)
-    except Exception as e:
-        print(f"[Upload] Extraction failed for {filename}: {e}")
-        return jsonify({"success": False,
-                        "message": "Couldn't read that file — it may be corrupted, password-protected, "
-                                   "or an unsupported format. Try another file or paste the template "
-                                   "text instead."}), 400
+    with conv["lock"]:
+        if conv["stage"] != "ask_template":
+            return jsonify({"success": False, "message": "Not expecting a template upload right now."}), 400
 
-    if not extracted.strip():
-        return jsonify({"success": False,
-                        "message": "No readable text was found in that file (it may be a scanned "
-                                   "image rather than real text). Try another file or paste the "
-                                   "template text instead."}), 400
+        try:
+            extracted = (extract_text_from_docx(f.stream) if ext == '.docx'
+                         else extract_text_from_pdf(f.stream))
+        except Exception as e:
+            print(f"[Upload] Extraction failed for {filename}: {e}")
+            return jsonify({"success": False,
+                            "message": "Couldn't read that file — it may be corrupted, password-protected, "
+                                       "or an unsupported format. Try another file or paste the template "
+                                       "text instead."}), 400
 
-    push(conv, "user", f"📎 Uploaded template: {filename}")
+        if not extracted.strip():
+            return jsonify({"success": False,
+                            "message": "No readable text was found in that file (it may be a scanned "
+                                       "image rather than real text). Try another file or paste the "
+                                       "template text instead."}), 400
 
-    conv["template_text"] = extracted
-    conv["template_source"] = f"uploaded file: {filename}"
-    conv["mode"] = "template"
-    ask_for_template_details(
-        conv,
-        f'Got it — I\'ve read "{filename}". Click below to enter the data to fill into it '
-        f'(names, dates, amounts, and any other specifics).'
-    )
-
-    return jsonify({
-        "success": True,
-        "messages": conv["messages"],
-        "stage": conv["stage"],
-        "can_generate": conv["stage"] == "brainstorm",
-    })
+        push(conv, "user", f"📎 Uploaded template: {filename}")
+        conv["template_text"] = extracted
+        conv["template_source"] = f"uploaded file: {filename}"
+        conv["mode"] = "template"
+        ask_for_template_details(
+            conv,
+            f'Got it — I\'ve read "{filename}". Click below to enter the data to fill into it '
+            f'(names, dates, amounts, and any other specifics).'
+        )
+        return jsonify({
+            "success": True,
+            "messages": conv["messages"],
+            "stage": conv["stage"],
+            "can_generate": conv["stage"] == "brainstorm",
+        })
 
 
 @app.route('/api/generate', methods=['POST'])
 def api_generate():
+    """Starts draft generation in the background and returns immediately.
+    The client then polls /api/generate_status/<conv_id> and sees the draft stream in."""
     data = request.get_json(silent=True) or {}
-    conv_id = data.get('conv_id', '')
-    conv = get_conversation(conv_id)
+    conv = get_conversation(data.get('conv_id', ''))
     if not conv:
         return jsonify({"success": False, "message": "Conversation not found. Start a new draft."}), 404
-    if conv["stage"] != "brainstorm":
-        return jsonify({"success": False, "message": "Finish the setup questions before generating a draft."}), 400
     if not os.environ.get('GROQ_API_KEY', '').strip():
         return jsonify({"success": False,
                         "message": "GROQ_API_KEY not set. Get a free key at https://console.groq.com"}), 400
 
-    try:
-        draft_text = generate_draft(conv)
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+    with conv["lock"]:
+        if conv["stage"] != "brainstorm":
+            return jsonify({"success": False,
+                            "message": "Finish the setup questions before generating a draft."}), 400
+        job = conv.get("job")
+        if job and job["status"] == "running":
+            return jsonify({"success": True, "status": "running"})
+        system, prompt = build_draft_prompt(conv)
+        job = {"id": uuid.uuid4().hex, "status": "running", "text": "", "error": "",
+               "started": time.time()}
+        conv["job"] = job
 
-    note = "Here's a draft based on everything we've discussed. Review it in the side panel, and keep chatting if you'd like changes — you can regenerate any time."
-    push(conv, "assistant", note)
+    threading.Thread(target=_run_generation_job, args=(conv, job, system, prompt),
+                     daemon=True).start()
+    return jsonify({"success": True, "status": "running"})
 
-    return jsonify({
-        "success": True,
-        "draft_text": draft_text,
-        "messages": conv["messages"],
-    })
+
+@app.route('/api/generate_status/<conv_id>')
+def api_generate_status(conv_id):
+    conv = get_conversation(conv_id)
+    if not conv:
+        return jsonify({"success": False, "message": "Conversation not found."}), 404
+    job = conv.get("job")
+    if not job:
+        return jsonify({"success": False, "message": "No draft is being generated."}), 400
+
+    have = request.args.get('have', default=-1, type=int)
+    status = job["status"]
+    text = job["text"]
+    resp = {"success": True, "status": status}
+    if len(text) != have:                 # only resend the text when it has changed
+        resp["draft_text"] = text
+    if status == "done":
+        resp["messages"] = conv["messages"]
+        resp["has_docx"] = bool(conv.get("docx_path"))
+    elif status == "error":
+        resp["message"] = job["error"] or "Draft generation failed."
+    return jsonify(resp)
 
 
 @app.route('/api/download/<conv_id>')
@@ -1662,17 +2032,42 @@ document.getElementById('modal-submit').onclick = () => {
   sendMessage(val);
 };
 
-function setBusy(busy){
-  typingEl.style.display = busy ? 'block' : 'none';
-  sendBtn.disabled = busy;
-  generateBtn.disabled = busy;
-  if (busy) scrollBottom();
+let busy = false;
+function setBusy(b, label){
+  busy = b;
+  typingEl.textContent = label || 'Dratido is thinking…';
+  typingEl.style.display = b ? 'block' : 'none';
+  sendBtn.disabled = b;
+  generateBtn.disabled = b;
+  if (b) scrollBottom();
+}
+
+// fetch wrapper: never throws, always resolves to an object with .success / .message.
+// (Previously a network error or an HTML 500 page left the UI stuck on "thinking…".)
+async function api(url, opts){
+  let res;
+  try { res = await fetch(url, opts); }
+  catch (e){ return {success:false, message:'Network error — please check your connection and try again.'}; }
+  let data = null;
+  try { data = await res.json(); } catch (e){}
+  if (!data) data = {success:false, message:'Unexpected server response (HTTP ' + res.status + '). Please try again.'};
+  data.http = res.status;
+  return data;
+}
+
+function failed(data){
+  if (data.http === 404){
+    // The server forgot this conversation (restart / idle spin-down on the free tier).
+    alert('This session has expired because the server restarted or was idle. Starting a fresh draft.');
+    startConversation();
+  } else {
+    alert(data.message || 'Something went wrong.');
+  }
 }
 
 async function startConversation(){
   setBusy(true);
-  const res = await fetch('/api/start', {method:'POST'});
-  const data = await res.json();
+  const data = await api('/api/start', {method:'POST'});
   setBusy(false);
   if (data.success){
     convId = data.conv_id;
@@ -1682,55 +2077,94 @@ async function startConversation(){
     panelFooter.style.display = 'none';
     panelBody.innerHTML = '<div class="placeholder">Your draft will appear here once we\'ve brainstormed enough to generate it.</div>';
     renderMessages(data.messages);
+  } else {
+    alert(data.message || 'Could not start a new draft. Please reload the page.');
   }
 }
 
 async function sendMessage(text){
-  if (!text || !text.trim() || !convId) return;
+  if (busy || !text || !text.trim() || !convId) return;
+  const typed = inputEl.value;
   inputEl.value = '';
   autoGrow();
   setBusy(true);
-  const res = await fetch('/api/message', {
+  const data = await api('/api/message', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({conv_id: convId, text: text})
   });
-  const data = await res.json();
   setBusy(false);
   if (data.success){
     renderMessages(data.messages);
     canGenerate = !!data.can_generate;
     generateBtn.style.display = canGenerate ? 'inline-block' : 'none';
   } else {
-    alert(data.message || 'Something went wrong.');
+    if (!inputEl.value) { inputEl.value = typed; autoGrow(); }   // don't lose what they typed
+    failed(data);
   }
 }
 
 async function generateDraft(){
-  if (!convId) return;
-  setBusy(true);
-  const res = await fetch('/api/generate', {
+  if (busy || !convId) return;
+  const myConv = convId;
+  setBusy(true, 'Drafting your document…');
+  const start = await api('/api/generate', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({conv_id: convId})
+    body: JSON.stringify({conv_id: myConv})
   });
-  const data = await res.json();
-  setBusy(false);
-  if (data.success){
-    renderMessages(data.messages);
-    showDraft(data.draft_text);
-    openPanel();
-  } else {
-    alert(data.message || 'Could not generate the draft.');
+  if (!start.success){ setBusy(false); failed(start); return; }
+
+  hasDraft = false;
+  showDraft('Starting…', false);
+  openPanel();
+
+  let have = -1, current = '', errors = 0;
+  while (convId === myConv){
+    await new Promise(r => setTimeout(r, 600));
+    const s = await api('/api/generate_status/' + myConv + '?have=' + have);
+    if (convId !== myConv) return;                 // user started a new draft meanwhile
+    if (!s.success){
+      if (s.http === 404 || ++errors > 5){ setBusy(false); failed(s); return; }
+      continue;
+    }
+    errors = 0;
+    if (typeof s.draft_text === 'string'){
+      have = s.draft_text.length;
+      current = s.draft_text;
+      if (s.status === 'running') showDraft(current || 'Starting…', false);
+    }
+    if (s.status === 'done'){
+      setBusy(false);
+      renderMessages(s.messages);
+      showDraft(current, true);
+      return;
+    }
+    if (s.status === 'error'){
+      setBusy(false);
+      panelBody.innerHTML = '<div class="placeholder">The draft could not be generated. Close this panel and try again.</div>';
+      panelFooter.style.display = 'none';
+      alert(s.message || 'Could not generate the draft.');
+      return;
+    }
   }
 }
 
-function showDraft(text){
-  hasDraft = true;
-  panelBody.innerHTML = '';
-  const pre = document.createElement('div');
-  pre.id = 'draft-text';
+// While streaming (final=false) the text grows in place; once final the Download button appears.
+function showDraft(text, final){
+  let pre = document.getElementById('draft-text');
+  if (!pre){
+    panelBody.innerHTML = '';
+    pre = document.createElement('div');
+    pre.id = 'draft-text';
+    panelBody.appendChild(pre);
+  }
   pre.textContent = text;
-  panelBody.appendChild(pre);
-  panelFooter.style.display = 'block';
+  if (final){
+    hasDraft = true;
+    panelFooter.style.display = 'block';
+  } else {
+    panelFooter.style.display = 'none';
+    panelBody.scrollTop = panelBody.scrollHeight;
+  }
 }
 
 function openPanel(){ panelEl.classList.add('open'); }
@@ -1772,8 +2206,23 @@ startConversation();
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════[...]
 
+def _warmup():
+    """Do the one-time slow work (template decrypt, Groq model discovery, TLS handshake)
+    in the background at boot so the first real request doesn't pay for it."""
+    try:
+        load_moot_templates()
+        key = os.environ.get('GROQ_API_KEY', '').strip()
+        if key:
+            get_groq_models(key)
+    except Exception as e:
+        print(f"[Warmup] {e}")
+
+
+threading.Thread(target=_warmup, daemon=True).start()
+
+
 if __name__ == '__main__':
-    os.makedirs('generated', exist_ok=True)
+    os.makedirs(GENERATED_DIR, exist_ok=True)
 
     groq_key = os.environ.get('GROQ_API_KEY', '').strip()
     key_str = '✓ Groq — ready!' if groq_key else '✗ NOT SET — see below'
