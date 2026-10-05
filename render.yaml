@@ -5,6 +5,7 @@ services:
     plan: free
     branch: main
     buildCommand: pip install -r requirements.txt
+    healthCheckPath: /healthz
     # One worker on purpose: conversations and background generation jobs live in memory.
     # Threads let polling requests answer while a memorial is being generated; the longer
     # timeout covers slow AI replies and rate-limit waits.
