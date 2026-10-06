@@ -939,8 +939,12 @@ class _MootBuilder:
         groups = (('CASES', 'Cases Referred', True), ('STATUTES', 'Statutes Referred', False),
                   ('BOOKS', 'Books Referred', False), ('WEBSITES', 'Websites Referred', False))
         fn_norm = [(fid, _norm(t)) for fid, t in self.footnotes]
+        derived = self._cases_from_footnotes()
         for key, title, is_cases in groups:
             items = [re.sub(r'^\s*(?:\d{1,3}[\.\)]|[-•*])\s*', '', _tidy(x)) for x in self.secs.get(key, [])]
+            if is_cases:
+                seen = {_norm(re.split(r'[\[\(,]', x, 1)[0]) for x in items}
+                items += [d for d in derived if _norm(re.split(r'[\[\(,]', d, 1)[0]) not in seen]
             if not items:
                 continue
             self.heading(title, 2, center=False, pbb=False, before=10, after=6)
@@ -956,6 +960,17 @@ class _MootBuilder:
                     if hit:
                         _style_run(p.add_run('\t'))
                         _field(p, f'PAGEREF {self.fn_bm[hit]} \\h')
+
+    def _cases_from_footnotes(self):
+        out, seen = [], set()
+        for _, t in self.footnotes:
+            for seg in re.split(r';', t):
+                seg = re.sub(r'^\s*(?:see also|see|also|cf\.?)\s*:?\s*', '', seg.strip(), flags=re.I).rstrip('.').strip()
+                if re.search(r'\s[vV]s?\.?\s', seg) and re.search(r'[\[\(]\s*\d{4}|\b(AIR|SCC|SCR)\b', seg):
+                    k = _norm(re.split(r'[\[\(,]', seg, 1)[0])
+                    if k and k not in seen:
+                        seen.add(k); out.append(seg)
+        return out
 
     def abbreviations(self):
         self.heading('Index of Abbreviations', 1)
@@ -1416,6 +1431,38 @@ DRAFT_SYSTEM_MOOT = (
 )
 
 
+
+MOOT_FRONT_NOTE = (
+    "\n\nTHIS PASS: output ONLY these tags, in order: @@COVER, @@STATUTES, @@BOOKS, @@WEBSITES, "
+    "@@ABBREVIATIONS, @@JURISDICTION, @@FACTS, @@ISSUES, @@SUMMARY, @@PRAYER, @@SIGNATURE. Do NOT output "
+    "@@CASES or @@ARGUMENTS (they are produced separately). Be as full as a real competition memorial: "
+    "@@STATUTES 6-10 entries; @@BOOKS 5-8 entries; @@WEBSITES 4 entries; @@ABBREVIATIONS 25-40 entries "
+    "(every abbreviation used, plus standard ones like AIR, SCC, HC, SC, Art, s, v, Ors, UOI); "
+    "@@JURISDICTION 1-2 paragraphs with a footnote reproducing EACH statutory provision relied on; "
+    "@@FACTS 10-15 detailed numbered paragraphs; @@ISSUES 3-5 issues; @@SUMMARY one 120-180 word "
+    "paragraph per issue with footnotes; @@PRAYER one relief per issue plus consequential relief."
+)
+
+DRAFT_SYSTEM_MOOT_ARGS = (
+    "You are an expert moot-court drafter writing ONE issue of the ARGUMENTS ADVANCED section of a "
+    "memorial, to the depth of a national-level winning memorial. Plain text only (no markdown, no "
+    "asterisks). Do NOT output any @@ tag, preamble or commentary. Format exactly:\n"
+    "# <n>. <THE ISSUE STATED AS A POSITIVE PROPOSITION IN CAPS>\n"
+    "It is humbly submitted before this Hon'ble Court that ... because:\n"
+    "(a) <ground one>\n(b) <ground two>\n(c) <ground three>\n"
+    "then 3-5 sub-headings, each written as '## A. SUB-HEADING IN CAPS' (A., B., C., ...) with 5-7 "
+    "numbered paragraphs under each ('1. ...', numbering continuing across sub-headings within the issue). "
+    "In total write AT LEAST 20 numbered paragraphs for the issue. Each paragraph is 70-130 words: state the "
+    "rule, cite and explain the authority ('In X v Y, the Hon'ble Supreme Court held that ...'), and then "
+    "apply it to the facts of THIS case ('In the present case, ...'). Anticipate and rebut the opposite "
+    "side's likely contentions. Put each citation in an inline footnote immediately after the sentence it "
+    "supports, written {{fn: Case Name, [Year] Vol Reporter Page.}}; statutes as {{fn: s 9, Code of Civil "
+    "Procedure 1908.}}; facts as {{fn: Moot Proposition ¶ 7.}}; several authorities in one footnote are "
+    "separated by semicolons. Use ONLY real, well-known authorities with correct citations that you are "
+    "confident about — never invent a case; if unsure, rely on the statutory text and general principles. "
+    "Cite roughly 15-25 distinct authorities for the issue. Write squarely for the side given."
+)
+
 TEMPLATE_SWITCH_VALUE = "I'd like to provide a reference template and enter the data to fill into it."
 
 
@@ -1787,6 +1834,52 @@ DRAFT_READY_NOTE = ("Here's a draft based on everything we've discussed. Review 
                     "panel, and keep chatting if you'd like changes — you can regenerate any time.")
 
 
+
+def generate_moot_memorial(conv, system, prompt, on_text, max_tokens):
+    """Multi-pass generation so the memorial reaches the length of real competition memorials:
+    pass 1 = front matter/facts/issues/summary/prayer; then one pass per issue for the arguments
+    (each long and heavily footnoted). The Index of Authorities is derived from the footnotes."""
+    front = ai_generate(prompt, system=system + MOOT_FRONT_NOTE, temperature=0.4,
+                        max_tokens=max_tokens, on_text=on_text, max_continuations=3)
+    front = _clean_draft(front)
+    issues = []
+    m = re.search(r'@@\s*ISSUES\s*:?\s*\n(.*?)(?=\n\s*@@|\Z)', front, re.S)
+    if m:
+        lines = [l.strip() for l in m.group(1).splitlines() if l.strip()]
+        for i, l in enumerate(lines):
+            if re.match(r'^ISSUE\s*[0-9IVX]+', l, re.I):
+                rest = re.sub(r'^ISSUE\s*[0-9IVX]+\s*[:.\-]?\s*', '', l, flags=re.I)
+                if not rest and i + 1 < len(lines):
+                    rest = lines[i + 1]
+                issues.append(rest)
+    issues = [x for x in issues if x][:6] or ["the principal issue in the moot problem"]
+
+    details = conv["details"][:9000]
+    side = conv["side"] or "the side specified"
+    notes = _digest(conv, 1500)
+    facts_ctx = ""
+    fm = re.search(r'@@\s*FACTS\s*:?\s*\n(.*?)(?=\n\s*@@|\Z)', front, re.S)
+    if fm:
+        facts_ctx = fm.group(1).strip()[:3500]
+    parts = ["@@ARGUMENTS"]
+    for n, issue in enumerate(issues, 1):
+        others = "\n".join(f"Issue {k}: {t}" for k, t in enumerate(issues, 1))
+        p = (f"MOOT PROBLEM:\n{details}\n\nSTATEMENT OF FACTS (as drafted):\n{facts_ctx}\n\n"
+             f"ALL ISSUES:\n{others}\n\nSIDE TO ARGUE FOR: {side}\n\nBRAINSTORM NOTES:\n{notes}\n\n"
+             f"Now write the full arguments for ISSUE {n} ONLY: {issue}\n"
+             f"Start with the line '# {n}. ' followed by the issue as a positive proposition in caps.")
+        base = front + "\n" + "\n".join(parts) + "\n"
+        cb = (lambda t, _b=base: on_text(_b + t)) if on_text else None
+        out = ai_generate(p, system=DRAFT_SYSTEM_MOOT_ARGS, temperature=0.4, max_tokens=max_tokens,
+                          on_text=cb, max_continuations=3)
+        out = _clean_draft(out)
+        out = re.sub(r'(?m)^\s*@@.*$', '', out)      # strip any stray tags
+        parts.append(out.strip())
+        if on_text:
+            on_text(front + "\n" + "\n".join(parts) + "\n")
+    return front + "\n" + "\n".join(parts) + "\n"
+
+
 def _run_generation_job(conv, job, system, prompt):
     """Background worker: streams the draft into job['text'] so the UI can show it live,
     then builds the .docx. Runs in a thread so no HTTP request is held open for the
@@ -1796,9 +1889,11 @@ def _run_generation_job(conv, job, system, prompt):
             job["text"] = t
 
         is_moot = (conv.get("doc_type") == MOOT_MEMORIAL_DOC_TYPE)
-        text = ai_generate(prompt, system=system, temperature=0.4,
-                           max_tokens=MOOT_MAX_TOKENS if is_moot else DRAFT_MAX_TOKENS,
-                           on_text=on_text, max_continuations=6 if is_moot else 2)
+        if is_moot:
+            text = generate_moot_memorial(conv, system, prompt, on_text, MOOT_MAX_TOKENS)
+        else:
+            text = ai_generate(prompt, system=system, temperature=0.4,
+                               max_tokens=DRAFT_MAX_TOKENS, on_text=on_text, max_continuations=2)
         text = _clean_draft(text)
         job["text"] = text
 
