@@ -1009,7 +1009,14 @@ class _MootBuilder:
 
     def abbreviations(self):
         self.heading('Index of Abbreviations', 1)
-        rows = [ln.split('|', 1) for ln in self.secs.get('ABBREVIATIONS', []) if '|' in ln]
+        rows, seen = [], set()
+        for ln in self.secs.get('ABBREVIATIONS', []):
+            if '|' not in ln:
+                continue
+            ab, fl = ln.split('|', 1)
+            k = _norm(ab)
+            if k and k not in seen and len(ab.strip()) <= 14:
+                seen.add(k); rows.append([ab, fl])
         rows.sort(key=lambda r: r[0].strip().lower())
         t = self.doc.add_table(rows=1, cols=2)
         t.style = 'Table Grid'
@@ -1518,10 +1525,9 @@ DRAFT_SYSTEM_MOOT = (
 
 MOOT_FRONT_NOTE = (
     "\n\nTHIS PASS: output ONLY these tags, in order: @@COVER, @@STATUTES, @@BOOKS, @@WEBSITES, "
-    "@@ABBREVIATIONS, @@JURISDICTION, @@FACTS, @@ISSUES, @@SUMMARY, @@PRAYER, @@SIGNATURE. Do NOT output "
+    "@@JURISDICTION, @@FACTS, @@ISSUES, @@SUMMARY, @@PRAYER, @@SIGNATURE. Do NOT output "
     "@@CASES or @@ARGUMENTS (they are produced separately). Be as full as a real competition memorial: "
-    "@@STATUTES 6-10 entries; @@BOOKS 5-8 entries; @@WEBSITES 4 entries; @@ABBREVIATIONS 25-40 entries "
-    "(every abbreviation used, plus standard ones like AIR, SCC, HC, SC, Art, s, v, Ors, UOI); "
+    "@@STATUTES 6-10 entries; @@BOOKS 5-8 entries; @@WEBSITES 4 entries; do NOT write @@ABBREVIATIONS (it is generated automatically); "
     "@@JURISDICTION 1-2 paragraphs with a footnote reproducing EACH statutory provision relied on; "
     "@@FACTS 10-15 detailed numbered paragraphs; @@ISSUES 3-5 issues; @@SUMMARY one 120-180 word "
     "paragraph per issue with footnotes; @@PRAYER one relief per issue plus consequential relief."
@@ -1919,13 +1925,96 @@ DRAFT_READY_NOTE = ("Here's a draft based on everything we've discussed. Review 
 
 
 
+
+_ABBR_DICT = [
+    ("&", "And", r" & "), ("¶", "Paragraph", r"¶"), ("v", "Versus", r"\sv\.?\s"),
+    ("s", "Section", r"\bs\s?\d"), ("ss", "Sections", r"\bss\s?\d"),
+    ("Art", "Article", r"\bArt\b"), ("AIR", "All India Reporter", r"\bAIR\b"),
+    ("SCC", "Supreme Court Cases", r"\bSCC\b"), ("SCR", "Supreme Court Reports", r"\bSCR\b"),
+    ("SC", "Supreme Court", r"\bSC\b"), ("HC", "High Court", r"\bHC\b"),
+    ("Ors.", "Others", r"\bOrs\b"), ("Anr.", "Another", r"\bAnr\b"),
+    ("UOI", "Union of India", r"\bUOI\b"), ("i.e.", "That is", r"\bi\.e\."),
+    ("Hon'ble", "Honourable", r"Hon.ble"), ("No.", "Number", r"\bNo\."),
+    ("Pg.", "Page", r"\bPg\."), ("ILR", "Indian Law Reports", r"\bILR\b"),
+    ("Cri LJ", "Criminal Law Journal", r"Cri\s?LJ"), ("SCC OnLine", "SCC OnLine Database", r"SCC OnLine"),
+    ("CPC", "Code of Civil Procedure, 1908", r"\bCPC\b"), ("CrPC", "Code of Criminal Procedure, 1973", r"\bCrPC\b"),
+    ("IPC", "Indian Penal Code, 1860", r"\bIPC\b"), ("BNS", "Bharatiya Nyaya Sanhita, 2023", r"\bBNS\b"),
+    ("BNSS", "Bharatiya Nagarik Suraksha Sanhita, 2023", r"\bBNSS\b"),
+    ("BSA", "Bharatiya Sakshya Adhiniyam, 2023", r"\bBSA\b"), ("IEA", "Indian Evidence Act, 1872", r"\bIEA\b"),
+    ("HMA", "Hindu Marriage Act, 1955", r"\bHMA\b"), ("SMA", "Special Marriage Act, 1954", r"\bSMA\b"),
+    ("HSA", "Hindu Succession Act, 1956", r"\bHSA\b"), ("HAMA", "Hindu Adoptions and Maintenance Act, 1956", r"\bHAMA\b"),
+    ("GWA", "Guardians and Wards Act, 1890", r"\bGWA\b"), ("NI Act", "Negotiable Instruments Act, 1881", r"\bNI Act\b"),
+    ("IT Act", "Information Technology Act, 2000", r"\bIT Act\b"), ("POCSO", "Protection of Children from Sexual Offences Act, 2012", r"\bPOCSO\b"),
+    ("PWDVA", "Protection of Women from Domestic Violence Act, 2005", r"\bPWDVA\b"),
+    ("NDPS", "Narcotic Drugs and Psychotropic Substances Act, 1985", r"\bNDPS\b"),
+    ("SARFAESI", "Securitisation and Reconstruction of Financial Assets and Enforcement of Security Interest Act, 2002", r"SARFAESI"),
+    ("IBC", "Insolvency and Bankruptcy Code, 2016", r"\bIBC\b"), ("TPA", "Transfer of Property Act, 1882", r"\bTPA\b"),
+    ("ICA", "Indian Contract Act, 1872", r"\bICA\b"), ("SRA", "Specific Relief Act, 1963", r"\bSRA\b"),
+    ("FIR", "First Information Report", r"\bFIR\b"), ("TIP", "Test Identification Parade", r"\bTIP\b"),
+    ("DNA", "Deoxyribonucleic Acid", r"\bDNA\b"), ("NCLT", "National Company Law Tribunal", r"\bNCLT\b"),
+    ("NCLAT", "National Company Law Appellate Tribunal", r"\bNCLAT\b"), ("SEBI", "Securities and Exchange Board of India", r"\bSEBI\b"),
+    ("RBI", "Reserve Bank of India", r"\bRBI\b"), ("MP", "Madhya Pradesh", r"\bMP\b"),
+    ("AP", "Andhra Pradesh", r"\bA\.?P\.?\b"), ("UP", "Uttar Pradesh", r"\bUP\b"),
+    ("P&H", "Punjab and Haryana", r"P&H"), ("J&K", "Jammu and Kashmir", r"J&K"),
+    ("Bom", "Bombay", r"\bBom\b"), ("Cal", "Calcutta", r"\bCal\b"), ("Del", "Delhi", r"\bDel\b"),
+    ("Mad", "Madras", r"\bMad\b"), ("All", "Allahabad", r"\bAll\b(?=[ .\]\)]\s*\d|\s+HC)"),
+    ("Raj", "Rajasthan", r"\bRaj\b"), ("Ker", "Kerala", r"\bKer\b"), ("Guj", "Gujarat", r"\bGuj\b"),
+    ("Kar", "Karnataka", r"\bKar\b"), ("Pat", "Patna", r"\bPat\b"), ("Ori", "Orissa", r"\bOri\b"),
+    ("WB", "West Bengal", r"\bWB\b"), ("FB", "Full Bench", r"\bFB\b"),
+    ("FPC", "Frisk Penal Code, 1860", r"\bFPC\b"), ("FEA", "Frisk Evidence Act, 1872", r"\bFEA\b"),
+]
+
+
+def build_abbreviations(text: str, model_lines=None) -> list:
+    """Deterministic 'abbr | full form' lines: standard abbreviations actually used in the memorial
+    (so the list can never loop or repeat), plus any distinct, sane entries the model supplied."""
+    body = re.sub(r'(?ms)^\s*@@\s*ABBREVIATIONS.*?(?=^\s*@@|\Z)', '', text)
+    seen, out = set(), []
+    for abbr, full, pat in _ABBR_DICT:
+        if re.search(pat, body):
+            seen.add(abbr.lower()); out.append(f"{abbr} | {full}")
+    for ln in (model_lines or [])[:80]:
+        if '|' not in ln:
+            continue
+        ab, fl = [x.strip() for x in ln.split('|', 1)]
+        if ab and fl and len(ab) <= 14 and len(fl) <= 110 and ab.lower() not in seen \
+                and ab.lower() != fl.lower():
+            seen.add(ab.lower()); out.append(f"{ab} | {fl}")
+    return out
+
+
+def _dedupe_lines(text: str) -> str:
+    """Drop lines the model repeats verbatim (a degenerate loop), keeping the first occurrence."""
+    seen, out = set(), []
+    for ln in text.splitlines():
+        k = re.sub(r'^\s*\d+[\.\)]\s*', '', ln).strip().lower()
+        if len(k) > 12 and not k.startswith(('@@', '#')):
+            if k in seen:
+                continue
+            seen.add(k)
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _replace_abbreviations(text: str) -> str:
+    m = re.search(r'(?ms)^\s*@@\s*ABBREVIATIONS\s*:?[^\n]*\n(.*?)(?=^\s*@@|\Z)', text)
+    model_lines = [l.strip() for l in m.group(1).splitlines() if l.strip()] if m else []
+    lines = build_abbreviations(text, model_lines)
+    block = "@@ABBREVIATIONS\n" + "\n".join(lines) + "\n"
+    text = re.sub(r'(?ms)^\s*@@\s*ABBREVIATIONS.*?(?=^\s*@@|\Z)', '', text)
+    # place it before @@JURISDICTION to keep the memorial's section order
+    if re.search(r'(?m)^\s*@@\s*JURISDICTION', text):
+        return re.sub(r'(?m)^(\s*@@\s*JURISDICTION)', lambda mm: block + mm.group(1), text, count=1)
+    return text + "\n" + block
+
+
 def generate_moot_memorial(conv, system, prompt, on_text, max_tokens):
     """Multi-pass generation so the memorial reaches the length of real competition memorials:
     pass 1 = front matter/facts/issues/summary/prayer; then one pass per issue for the arguments
     (each long and heavily footnoted). The Index of Authorities is derived from the footnotes."""
     front = ai_generate(prompt, system=system + MOOT_FRONT_NOTE, temperature=0.4,
                         max_tokens=max_tokens, on_text=on_text, max_continuations=1)
-    front = _clean_draft(front)
+    front = _dedupe_lines(_clean_draft(front))
     issues = []
     m = re.search(r'@@\s*ISSUES\s*:?\s*\n(.*?)(?=\n\s*@@|\Z)', front, re.S)
     if m:
@@ -1971,7 +2060,7 @@ def generate_moot_memorial(conv, system, prompt, on_text, max_tokens):
         try:
             out = ai_generate(p, system=DRAFT_SYSTEM_MOOT_ARGS, temperature=0.4,
                               max_tokens=max_tokens, on_text=cb, max_continuations=2)
-            out = re.sub(r'(?m)^\s*@@.*$', '', _clean_draft(out))
+            out = re.sub(r'(?m)^\s*@@.*$', '', _dedupe_lines(_clean_draft(out)))
             with lock:
                 bufs[n] = out
         except Exception as ex:
@@ -1984,7 +2073,7 @@ def generate_moot_memorial(conv, system, prompt, on_text, max_tokens):
             pool.submit(run_issue, n, issue)
     if len(errors) == len(issues):
         raise RuntimeError(next(iter(errors.values())) or "Draft generation failed.")
-    return compose()
+    return _replace_abbreviations(compose())
 
 
 def _run_generation_job(conv, job, system, prompt):
