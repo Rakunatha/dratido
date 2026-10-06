@@ -90,7 +90,7 @@ def _int_env(name, default):
 
 BRAINSTORM_MAX_TOKENS = _int_env("BRAINSTORM_MAX_TOKENS", 900)
 DRAFT_MAX_TOKENS      = _int_env("DRAFT_MAX_TOKENS", 5000)
-MOOT_MAX_TOKENS       = _int_env("MOOT_MAX_TOKENS", 6000)
+MOOT_MAX_TOKENS       = _int_env("MOOT_MAX_TOKENS", 4500)
 
 _HTTP = requests.Session()
 _HTTP.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16))
@@ -1892,7 +1892,7 @@ def generate_moot_memorial(conv, system, prompt, on_text, max_tokens):
     pass 1 = front matter/facts/issues/summary/prayer; then one pass per issue for the arguments
     (each long and heavily footnoted). The Index of Authorities is derived from the footnotes."""
     front = ai_generate(prompt, system=system + MOOT_FRONT_NOTE, temperature=0.4,
-                        max_tokens=max_tokens, on_text=on_text, max_continuations=3)
+                        max_tokens=max_tokens, on_text=on_text, max_continuations=1)
     front = _clean_draft(front)
     issues = []
     m = re.search(r'@@\s*ISSUES\s*:?\s*\n(.*?)(?=\n\s*@@|\Z)', front, re.S)
@@ -1913,23 +1913,46 @@ def generate_moot_memorial(conv, system, prompt, on_text, max_tokens):
     fm = re.search(r'@@\s*FACTS\s*:?\s*\n(.*?)(?=\n\s*@@|\Z)', front, re.S)
     if fm:
         facts_ctx = fm.group(1).strip()[:3500]
-    parts = ["@@ARGUMENTS"]
-    for n, issue in enumerate(issues, 1):
-        others = "\n".join(f"Issue {k}: {t}" for k, t in enumerate(issues, 1))
+    # The issues are independent, so draft them in parallel (3 at a time) — much faster than
+    # one after another, while still giving every issue its own full-length pass.
+    from concurrent.futures import ThreadPoolExecutor
+    others = "\n".join(f"Issue {k}: {t}" for k, t in enumerate(issues, 1))
+    bufs = {n: "" for n in range(1, len(issues) + 1)}
+    errors = {}
+    lock = threading.Lock()
+
+    def compose():
+        return (front + "\n@@ARGUMENTS\n" +
+                "\n".join(bufs[k].strip() for k in sorted(bufs) if bufs[k].strip()) + "\n")
+
+    def run_issue(n, issue):
         p = (f"MOOT PROBLEM:\n{details}\n\nSTATEMENT OF FACTS (as drafted):\n{facts_ctx}\n\n"
              f"ALL ISSUES:\n{others}\n\nSIDE TO ARGUE FOR: {side}\n\nBRAINSTORM NOTES:\n{notes}\n\n"
              f"Now write the full arguments for ISSUE {n} ONLY: {issue}\n"
              f"Start with the line '# {n}. ' followed by the issue as a positive proposition in caps.")
-        base = front + "\n" + "\n".join(parts) + "\n"
-        cb = (lambda t, _b=base: on_text(_b + t)) if on_text else None
-        out = ai_generate(p, system=DRAFT_SYSTEM_MOOT_ARGS, temperature=0.4, max_tokens=max_tokens,
-                          on_text=cb, max_continuations=3)
-        out = _clean_draft(out)
-        out = re.sub(r'(?m)^\s*@@.*$', '', out)      # strip any stray tags
-        parts.append(out.strip())
-        if on_text:
-            on_text(front + "\n" + "\n".join(parts) + "\n")
-    return front + "\n" + "\n".join(parts) + "\n"
+
+        def cb(t):
+            with lock:
+                bufs[n] = t
+                if on_text:
+                    on_text(compose())
+        try:
+            out = ai_generate(p, system=DRAFT_SYSTEM_MOOT_ARGS, temperature=0.4,
+                              max_tokens=max_tokens, on_text=cb, max_continuations=2)
+            out = re.sub(r'(?m)^\s*@@.*$', '', _clean_draft(out))
+            with lock:
+                bufs[n] = out
+        except Exception as ex:
+            traceback.print_exc()
+            with lock:
+                errors[n] = str(ex)
+
+    with ThreadPoolExecutor(max_workers=min(3, len(issues))) as pool:
+        for n, issue in enumerate(issues, 1):
+            pool.submit(run_issue, n, issue)
+    if len(errors) == len(issues):
+        raise RuntimeError(next(iter(errors.values())) or "Draft generation failed.")
+    return compose()
 
 
 def _run_generation_job(conv, job, system, prompt):
