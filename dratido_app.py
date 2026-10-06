@@ -930,12 +930,44 @@ class _MootBuilder:
         _field(fp, 'PAGE', size=10)
 
     # ---------- body sections
+    def _toc_styles(self):
+        """Real Word 'TOC 1-3' styles so References > Update Table rebuilds the contents
+        (dotted right tab, indents) exactly like this layout."""
+        for lvl in (1, 2, 3):
+            try:
+                st = self.doc.styles.add_style(f'toc {lvl}', 1)
+            except Exception:
+                st = self.doc.styles[f'toc {lvl}']
+            st.base_style = self.doc.styles['Normal']
+            st.font.name = _TNR; st.font.size = Pt(12); st.font.bold = (lvl == 1)
+            pf = st.paragraph_format
+            pf.left_indent = Inches(0.3 * (lvl - 1))
+            pf.space_after = Pt(4)
+            pf.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+
     def toc_entries(self):
-        for lvl, text, bm in self.headings:
-            p = self.para('', align='left', after=4, left=0.3 * (lvl - 1))
-            p.paragraph_format.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+        """A genuine TOC field (TOC \\o "1-3" \\h \\z \\u) whose cached result is pre-filled, so it
+        looks right immediately AND Word can refresh it properly after the user edits the file."""
+        self._toc_styles()
+        last = None
+        for i, (lvl, text, bm) in enumerate(self.headings):
+            p = self.doc.add_paragraph(style=f'toc {min(lvl, 3)}')
+            p.paragraph_format.space_after = Pt(4)
+            p.paragraph_format.left_indent = Inches(0.3 * (lvl - 1))
+            if i == 0:
+                for kind in ('begin', None, 'separate'):
+                    r = p.add_run()
+                    if kind:
+                        fc = OxmlElement('w:fldChar'); fc.set(qn('w:fldCharType'), kind); r._r.append(fc)
+                    else:
+                        it = OxmlElement('w:instrText'); it.set(qn('xml:space'), 'preserve')
+                        it.text = ' TOC \\o "1-3" \\h \\z \\u '; r._r.append(it)
             _style_run(p.add_run(text + '\t'), bold=(lvl == 1))
             self.refs.append((bm, _field(p, f'PAGEREF {bm} \\h', bold=(lvl == 1))))
+            last = p
+        if last is not None:
+            r = last.add_run()
+            fc = OxmlElement('w:fldChar'); fc.set(qn('w:fldCharType'), 'end'); r._r.append(fc)
 
     def authorities(self):
         self.heading('Index of Authorities', 1)
