@@ -690,8 +690,10 @@ def _field(p, instr, cached='1', size=12, bold=False):
     b = OxmlElement('w:fldChar'); b.set(qn('w:fldCharType'), 'begin'); r(b)
     it = OxmlElement('w:instrText'); it.set(qn('xml:space'), 'preserve'); it.text = f' {instr} '; r(it)
     s = OxmlElement('w:fldChar'); s.set(qn('w:fldCharType'), 'separate'); r(s)
-    _style_run(p.add_run(cached), size=size, bold=bold)
+    cached_run = p.add_run(cached)
+    _style_run(cached_run, size=size, bold=bold)
     e = OxmlElement('w:fldChar'); e.set(qn('w:fldCharType'), 'end'); r(e)
+    return cached_run
 
 
 def _bookmark(p, name, bid):
@@ -712,6 +714,7 @@ class _MootBuilder:
         self.footnotes = []     # (id, text)
         self.fn_bm = {}         # footnote id -> bookmark name
         self._bid = 100
+        self.refs = []          # (bookmark, cached-text run) for every PAGEREF field
         self.cover = self._parse_cover()
         self.side_title = self.cover.get('MEMORIAL_TITLE', 'MEMORIAL').upper()
 
@@ -932,7 +935,7 @@ class _MootBuilder:
             p = self.para('', align='left', after=4, left=0.3 * (lvl - 1))
             p.paragraph_format.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
             _style_run(p.add_run(text + '\t'), bold=(lvl == 1))
-            _field(p, f'PAGEREF {bm} \\h', bold=(lvl == 1))
+            self.refs.append((bm, _field(p, f'PAGEREF {bm} \\h', bold=(lvl == 1))))
 
     def authorities(self):
         self.heading('Index of Authorities', 1)
@@ -959,7 +962,7 @@ class _MootBuilder:
                     hit = next((fid for fid, t in fn_norm if key_s and key_s in t), None)
                     if hit:
                         _style_run(p.add_run('\t'))
-                        _field(p, f'PAGEREF {self.fn_bm[hit]} \\h')
+                        self.refs.append((self.fn_bm[hit], _field(p, f'PAGEREF {self.fn_bm[hit]} \\h')))
 
     def _cases_from_footnotes(self):
         out, seen = [], set()
@@ -1096,6 +1099,54 @@ class _MootBuilder:
         u = OxmlElement('w:updateFields'); u.set(qn('w:val'), 'true')
         st.append(u)
 
+    def estimate_pages(self):
+        """Word only recalculates PAGEREF fields when the user accepts the 'update fields' prompt;
+        otherwise the cached text is shown. So we fill the cached text with an estimate of the real
+        page (simulated pagination) — the TOC/index then look right even if the prompt is declined."""
+        import math
+        fn_len = {fid: len(t) for fid, t in self.footnotes}
+        body = self.doc.element.body
+        W = lambda t: qn('w:' + t)
+        CAP, LH = 640.0, 13.8
+        page, cur, pages = 1, 0.0, {}
+        for el in list(body):
+            if el.tag == W('tbl'):
+                rows = len(el.findall(W('tr')))
+                h = rows * 22.0
+                if cur + h > CAP:
+                    page, cur = page + 1, 0.0
+                cur += h
+                continue
+            if el.tag != W('p'):
+                continue
+            pPr = el.find(W('pPr'))
+            sp = pPr.find(W('spacing')) if pPr is not None else None
+            line = (int(sp.get(W('line'), 240)) / 240.0) if sp is not None else 1.0
+            before = int(sp.get(W('before'), 0)) / 20.0 if sp is not None else 0.0
+            after = int(sp.get(W('after'), 0)) / 20.0 if sp is not None else 0.0
+            if pPr is not None and pPr.find(W('pageBreakBefore')) is not None \
+                    and not (pPr.find(W('pageBreakBefore')).get(W('val')) in ('0', 'false')):
+                if cur > 0:
+                    page, cur = page + 1, 0.0
+            text = ''.join(t.text or '' for t in el.iter(W('t')))
+            ind = pPr.find(W('ind')) if pPr is not None else None
+            left = int(ind.get(W('left'), 0)) / 1440.0 if ind is not None else 0.0
+            cpl = max(40, int((6.0 - left) * 14.5))
+            lines = max(1, math.ceil(len(text) / cpl))
+            h = lines * LH * line + before + after
+            for ref in el.iter(W('footnoteReference')):
+                h += math.ceil(fn_len.get(int(ref.get(W('id'))), 60) / 105.0) * 11.5 + 3
+            if cur + h > CAP:
+                page, cur = page + 1, 0.0
+            for bs in el.iter(W('bookmarkStart')):
+                pages[bs.get(W('name'))] = page
+            cur += h
+            if pPr is not None and pPr.find(W('sectPr')) is not None:
+                page, cur = page + 1, 0.0
+        for bm, run in self.refs:
+            if bm in pages:
+                run.text = str(pages[bm])
+
     def build(self):
         self.setup()
         self.build_cover()
@@ -1117,6 +1168,7 @@ class _MootBuilder:
         auth_h = self.headings[n0:]
         self.headings = self.headings[:1] + auth_h + self.headings[1:n0]   # authorities follow the TOC entry
         self.fill_at(m_toc, self.toc_entries)
+        self.estimate_pages()
         self.attach_footnotes()
         self.update_fields_on_open()
         return self.doc
