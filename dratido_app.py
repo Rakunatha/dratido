@@ -27,7 +27,7 @@ from requests.adapters import HTTPAdapter
 from flask import Flask, request, jsonify, send_file, Response
 from werkzeug.exceptions import HTTPException
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.table import Table
@@ -90,6 +90,7 @@ def _int_env(name, default):
 
 BRAINSTORM_MAX_TOKENS = _int_env("BRAINSTORM_MAX_TOKENS", 900)
 DRAFT_MAX_TOKENS      = _int_env("DRAFT_MAX_TOKENS", 5000)
+MOOT_MAX_TOKENS       = _int_env("MOOT_MAX_TOKENS", 6000)
 
 _HTTP = requests.Session()
 _HTTP.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16))
@@ -629,6 +630,497 @@ def build_ai_legal_docx(doc_type: str, ai_text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════[...]
+#  MOOT MEMORIAL DOCX BUILDER  (mirrors the format of real competition memorials)
+# ══════════════════════════════════════════════════════════════════[...]
+# The memorial is drafted by the AI in a tagged plain-text format (see DRAFT_SYSTEM_MOOT)
+# and laid out here: bordered cover page, running header/footer ("P a g e | n"), table of
+# contents and index of authorities with live page-number fields, 2-column abbreviations
+# table, real Word footnotes, issue-wise numbered arguments, prayer and signature block.
+from xml.sax.saxutils import escape as _xesc
+from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER, WD_LINE_SPACING
+from docx.enum.section import WD_SECTION
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml import OxmlElement, parse_xml
+from docx.shared import RGBColor
+from docx.opc.part import Part
+from docx.opc.packuri import PackURI
+from docx.opc.constants import RELATIONSHIP_TYPE as _RT
+
+_W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+_FN_RE = re.compile(r'\{\{\s*fn\s*:(.*?)\}\}', re.S)
+_MOOT_SECTIONS = ('COVER', 'CASES', 'STATUTES', 'BOOKS', 'WEBSITES', 'ABBREVIATIONS',
+                  'JURISDICTION', 'FACTS', 'ISSUES', 'SUMMARY', 'ARGUMENTS', 'PRAYER', 'SIGNATURE')
+
+
+def parse_moot_text(text: str) -> dict:
+    """Split '@@SECTION' tagged text into {SECTION: [lines]}. Empty dict if untagged."""
+    secs, cur = {}, None
+    for ln in text.splitlines():
+        m = re.match(r'^\s*@@\s*([A-Za-z_ ]+?)\s*:?\s*$', ln)
+        if m:
+            name = m.group(1).strip().upper().replace(' ', '_')
+            cur = name if name in _MOOT_SECTIONS else None
+            if cur:
+                secs.setdefault(cur, [])
+            continue
+        if cur is not None and ln.strip():
+            secs[cur].append(ln.strip())
+    return secs if ('ARGUMENTS' in secs and 'COVER' in secs) else {}
+
+
+def _tidy(s):
+    s = re.sub(r'^#{1,6}\s*', '', s.strip())
+    return s.replace('**', '').replace('__', '')
+
+
+def _border(p, edge, sz=24, val='single', space=4):
+    pPr = p._p.get_or_add_pPr()
+    bdr = pPr.find(qn('w:pBdr'))
+    if bdr is None:
+        bdr = OxmlElement('w:pBdr'); pPr.append(bdr)
+    e = OxmlElement(f'w:{edge}')
+    for k, v in (('val', val), ('sz', str(sz)), ('space', str(space)), ('color', '000000')):
+        e.set(qn(f'w:{k}'), v)
+    bdr.append(e)
+
+
+def _field(p, instr, cached='1', size=12, bold=False):
+    def r(child):
+        run = p.add_run(); _style_run(run, size=size, bold=bold); run._r.append(child); return run
+    b = OxmlElement('w:fldChar'); b.set(qn('w:fldCharType'), 'begin'); r(b)
+    it = OxmlElement('w:instrText'); it.set(qn('xml:space'), 'preserve'); it.text = f' {instr} '; r(it)
+    s = OxmlElement('w:fldChar'); s.set(qn('w:fldCharType'), 'separate'); r(s)
+    _style_run(p.add_run(cached), size=size, bold=bold)
+    e = OxmlElement('w:fldChar'); e.set(qn('w:fldCharType'), 'end'); r(e)
+
+
+def _bookmark(p, name, bid):
+    s = OxmlElement('w:bookmarkStart'); s.set(qn('w:id'), str(bid)); s.set(qn('w:name'), name)
+    e = OxmlElement('w:bookmarkEnd'); e.set(qn('w:id'), str(bid))
+    return s, e
+
+
+def _norm(s):
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+class _MootBuilder:
+    def __init__(self, secs):
+        self.secs = secs
+        self.doc = Document()
+        self.headings = []      # (level, text, bookmark)
+        self.footnotes = []     # (id, text)
+        self.fn_bm = {}         # footnote id -> bookmark name
+        self._bid = 100
+        self.cover = self._parse_cover()
+        self.side_title = self.cover.get('MEMORIAL_TITLE', 'MEMORIAL').upper()
+
+    # ---------- helpers
+    def _bm_id(self):
+        self._bid += 1
+        return self._bid
+
+    def _parse_cover(self):
+        d, parties = {}, []
+        for ln in self.secs.get('COVER', []):
+            k, _, v = ln.partition(':')
+            k = k.strip().upper().replace(' ', '_')
+            if k.startswith('PARTY'):
+                parties.append(v.strip())
+            else:
+                d[k] = v.strip()
+        d['PARTIES'] = parties
+        return d
+
+    def para(self, text='', size=12, bold=False, italic=False, align='justify', before=0, after=6,
+             line=None, left=None, first=None, keep=False):
+        p = self.doc.add_paragraph()
+        p.alignment = {'justify': WD_ALIGN_PARAGRAPH.JUSTIFY, 'center': WD_ALIGN_PARAGRAPH.CENTER,
+                       'left': WD_ALIGN_PARAGRAPH.LEFT, 'right': WD_ALIGN_PARAGRAPH.RIGHT}[align]
+        pf = p.paragraph_format
+        pf.space_before, pf.space_after = Pt(before), Pt(after)
+        if line:
+            pf.line_spacing = line
+        if left is not None:
+            pf.left_indent = Inches(left)
+        if first is not None:
+            pf.first_line_indent = Inches(first)
+        if keep:
+            pf.keep_with_next = True
+        if text:
+            self.rich(p, text, size=size, bold=bold, italic=italic)
+        return p
+
+    def rich(self, p, text, size=12, bold=False, italic=False):
+        """Text with inline {{fn: ...}} footnotes and tidy markdown."""
+        pos = 0
+        for m in _FN_RE.finditer(text):
+            self._plain(p, text[pos:m.start()], size, bold, italic)
+            self._footnote_ref(p, m.group(1).strip())
+            pos = m.end()
+        self._plain(p, text[pos:], size, bold, italic)
+
+    def _plain(self, p, t, size, bold, italic):
+        if not t:
+            return
+        if italic:
+            for part in _INLINE_RE.split(t):
+                if part:
+                    _style_run(p.add_run(part.replace('**', '').strip('*') if part.startswith('*') else part),
+                               size=size, bold=bold, italic=True)
+        else:
+            _add_runs(p, t, size=size, bold=bold)
+
+    def _footnote_ref(self, p, text):
+        fid = len(self.footnotes) + 1
+        self.footnotes.append((fid, _tidy(text)))
+        name = f'fn_{fid}'
+        self.fn_bm[fid] = name
+        bs, be = _bookmark(p, name, self._bm_id())
+        run = p.add_run()
+        rPr = run._r.get_or_add_rPr()
+        va = OxmlElement('w:vertAlign'); va.set(qn('w:val'), 'superscript'); rPr.append(va)
+        ref = OxmlElement('w:footnoteReference'); ref.set(qn('w:id'), str(fid))
+        p._p.append(bs); p._p.append(run._r); p._p.append(be)
+        run._r.append(ref)
+
+    def heading(self, text, level=1, center=None, pbb=None, before=6, after=10):
+        text = _tidy(text)
+        p = self.doc.add_paragraph(style=f'Heading {level}')
+        if center is None:
+            center = (level == 1)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER if center else WD_ALIGN_PARAGRAPH.LEFT
+        pf = p.paragraph_format
+        pf.space_before, pf.space_after, pf.keep_with_next = Pt(before), Pt(after), True
+        pf.page_break_before = (level == 1) if pbb is None else pbb
+        name = f'h_{len(self.headings) + 1}'
+        bs, be = _bookmark(p, name, self._bm_id())
+        p._p.append(bs)
+        _style_run(p.add_run(text.upper() if level == 1 else text), size=14 if level == 1 else 12, bold=True)
+        p._p.append(be)
+        self.headings.append((level, text.upper() if level == 1 else text, name))
+        return p
+
+    def numbered(self, n, text, **kw):
+        p = self.para('', line=1.5, **kw)
+        _style_run(p.add_run(f'{n}.  '), bold=False)
+        self.rich(p, text)
+        return p
+
+    def fill_at(self, marker, fn):
+        """Run fn() (which appends to the document end) then move its output before marker."""
+        body = self.doc.element.body
+        n0 = len(body)
+        fn()
+        new = list(body)[n0 - 1:len(body) - 1]
+        for el in new:
+            marker._p.addprevious(el)
+        marker._p.getparent().remove(marker._p)
+
+    # ---------- styles / sections
+    def setup(self):
+        d = self.doc
+        for lvl in (1, 2, 3):
+            st = d.styles[f'Heading {lvl}']
+            st.font.name = _TNR; st.font.size = Pt(12); st.font.bold = True
+            st.font.color.rgb = RGBColor(0, 0, 0)
+            rpr = st.element.get_or_add_rPr()
+            rf = rpr.find(qn('w:rFonts'))
+            if rf is None:
+                rf = OxmlElement('w:rFonts'); rpr.append(rf)
+            for a in ('ascii', 'hAnsi', 'eastAsia', 'cs'):
+                rf.set(qn(f'w:{a}'), _TNR)
+        n = d.styles['Normal']
+        n.font.name = _TNR; n.font.size = Pt(12)
+        n.element.get_or_add_rPr().find(qn('w:rFonts')).set(qn('w:eastAsia'), _TNR)
+        s = d.sections[0]
+        s.page_width, s.page_height = Inches(8.27), Inches(11.69)
+        s.top_margin = s.bottom_margin = Inches(1)
+        s.left_margin = s.right_margin = Inches(1.25)
+
+    def build_cover(self):
+        c, d = self.cover, self.doc
+        t = d.add_table(rows=1, cols=1)
+        t.alignment = WD_TABLE_ALIGNMENT.RIGHT
+        t.style = 'Table Grid'
+        t.autofit = False
+        t.columns[0].width = Inches(1.9)
+        cell = t.rows[0].cells[0]
+        cell.width = Inches(1.9)
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement('w:shd'); shd.set(qn('w:val'), 'clear'); shd.set(qn('w:fill'), 'FFFFFF')
+        tcPr.append(shd)
+        cp = cell.paragraphs[0]
+        cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _style_run(cp.add_run(f"Team Code: {c.get('TEAM_CODE', '______')}"), size=11)
+        self.para('', after=14)
+        p = self.para(c.get('COMPETITION', 'MOOT COURT COMPETITION'), bold=True, align='center', before=8, after=8)
+        _border(p, 'top', 36); _border(p, 'bottom', 36)
+        self.para('Before', italic=True, align='center', before=14, after=10)
+        p = self.para(c.get('COURT', ''), align='center', after=10)
+        for r in p.runs: r.font.small_caps = True
+        _border(p, 'bottom', 24)
+        if c.get('CASE_NO'):
+            p = self.para(c['CASE_NO'], align='center', before=10, after=14)
+            for r in p.runs: r.font.small_caps = True
+        if c.get('FILED_UNDER'):
+            p = self.para(c['FILED_UNDER'], align='center', before=8, after=8)
+            _border(p, 'top', 36); _border(p, 'bottom', 36)
+        if c.get('SUBJECT'):
+            p = self.para(c['SUBJECT'], size=10, align='center', before=14, after=14)
+            for r in p.runs: r.font.small_caps = True
+        p = self.para('IN THE MATTER BETWEEN:', size=10, align='center', before=10, after=14)
+        parties = c['PARTIES'] or ['PARTY ONE | PETITIONER', 'PARTY TWO | RESPONDENT']
+        for i, pt in enumerate(parties[:2]):
+            name, _, role = pt.partition('|')
+            p = self.para('', align='left', before=6, after=6)
+            p.paragraph_format.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+            _style_run(p.add_run(f'{name.strip().upper()}\t{role.strip().upper()}'))
+            if i == 0:
+                _border(p, 'top', 12, 'double'); 
+                self.para('v', size=10, align='center', before=8, after=8)
+            else:
+                _border(p, 'bottom', 12, 'double')
+        p = self.para(self.side_title, bold=True, align='center', before=40, after=8)
+        _border(p, 'bottom', 36)
+
+    def cover_color(self):
+        s = (self.side_title + ' ' + ' '.join(self.cover.get('PARTIES', []))[-0:]).lower()
+        s = self.side_title.lower()
+        return 'E0312B' if re.search(r'respondent|defendant|opposite|non-?appellant', s) else '4472C4'
+
+    def cover_background(self):
+        """Full-page colour rectangle, anchored to the page behind the text, in the cover
+        section's header (so it shows on the cover page only)."""
+        hp = self.doc.sections[0].header.paragraphs[0]
+        hp.paragraph_format.space_after = Pt(0)
+        xml = (f'<w:r xmlns:w="{_W_NS}" xmlns:v="urn:schemas-microsoft-com:vml"><w:pict>'
+               f'<v:rect style="position:absolute;margin-left:0;margin-top:0;width:{8.27*72:.1f}pt;'
+               f'height:{11.69*72:.1f}pt;z-index:-251658240;mso-position-horizontal-relative:page;'
+               f'mso-position-vertical-relative:page" fillcolor="#{self.cover_color()}" stroked="f"/>'
+               f'</w:pict></w:r>')
+        hp._p.append(parse_xml(xml))
+
+    def first_section_border(self):
+        self.cover_background()
+        sect = self.doc.sections[0]._sectPr
+        pg = parse_xml(
+            f'<w:pgBorders xmlns:w="{_W_NS}" w:offsetFrom="page">' +
+            ''.join(f'<w:{e} w:val="thinThickSmallGap" w:sz="24" w:space="24" w:color="000000"/>'
+                    for e in ('top', 'left', 'bottom', 'right')) + '</w:pgBorders>')
+        pgmar = sect.find(qn('w:pgMar'))
+        pgmar.addnext(pg)
+
+    def header_footer(self):
+        sec = self.doc.sections[1]
+        sec.header.is_linked_to_previous = False
+        sec.footer.is_linked_to_previous = False
+        hp = sec.header.paragraphs[0]
+        hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _style_run(hp.add_run(self.side_title), size=10, bold=True)
+        _border(hp, 'bottom', 8, space=2)
+        fp = sec.footer.paragraphs[0]
+        fp.style = self.doc.styles['Normal']
+        hp.style = self.doc.styles['Normal']
+        fp.paragraph_format.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT)
+        _style_run(fp.add_run(f"Team Code: {self.cover.get('TEAM_CODE', '______')}\tP a g e | "), size=10)
+        _field(fp, 'PAGE', size=10)
+
+    # ---------- body sections
+    def toc_entries(self):
+        for lvl, text, bm in self.headings:
+            p = self.para('', align='left', after=4, left=0.3 * (lvl - 1))
+            p.paragraph_format.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+            _style_run(p.add_run(text + '\t'), bold=(lvl == 1))
+            _field(p, f'PAGEREF {bm} \\h', bold=(lvl == 1))
+
+    def authorities(self):
+        self.heading('Index of Authorities', 1)
+        groups = (('CASES', 'Cases Referred', True), ('STATUTES', 'Statutes Referred', False),
+                  ('BOOKS', 'Books Referred', False), ('WEBSITES', 'Websites Referred', False))
+        fn_norm = [(fid, _norm(t)) for fid, t in self.footnotes]
+        for key, title, is_cases in groups:
+            items = [re.sub(r'^\s*(?:\d{1,3}[\.\)]|[-•*])\s*', '', _tidy(x)) for x in self.secs.get(key, [])]
+            if not items:
+                continue
+            self.heading(title, 2, center=False, pbb=False, before=10, after=6)
+            if is_cases:
+                items.sort(key=lambda s: s.lower())
+            for i, it in enumerate(items, 1):
+                p = self.para('', align='left', after=4, left=0.35, first=-0.35)
+                p.paragraph_format.tab_stops.add_tab_stop(Inches(5.77), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+                _style_run(p.add_run((f'{i}.  ' if is_cases else '•  ') + it))
+                if is_cases:
+                    key_s = _norm(re.split(r'[\[\(,]', it, 1)[0])
+                    hit = next((fid for fid, t in fn_norm if key_s and key_s in t), None)
+                    if hit:
+                        _style_run(p.add_run('\t'))
+                        _field(p, f'PAGEREF {self.fn_bm[hit]} \\h')
+
+    def abbreviations(self):
+        self.heading('Index of Abbreviations', 1)
+        rows = [ln.split('|', 1) for ln in self.secs.get('ABBREVIATIONS', []) if '|' in ln]
+        rows.sort(key=lambda r: r[0].strip().lower())
+        t = self.doc.add_table(rows=1, cols=2)
+        t.style = 'Table Grid'
+        t.alignment = WD_TABLE_ALIGNMENT.CENTER
+        t.autofit = False
+        for c, h in zip(t.rows[0].cells, ('Abbreviation', 'Full Form')):
+            _style_run(c.paragraphs[0].add_run(h), bold=True)
+        for a, f in rows:
+            cells = t.add_row().cells
+            _style_run(cells[0].paragraphs[0].add_run(_tidy(a)))
+            _style_run(cells[1].paragraphs[0].add_run(_tidy(f)))
+        for r in t.rows:
+            r.cells[0].width, r.cells[1].width = Inches(1.7), Inches(4.3)
+
+    def plain_section(self, key, title, numbered=True):
+        self.heading(title, 1)
+        n = 0
+        for ln in self.secs.get(key, []):
+            m = _NUMBERED_RE.match(ln)
+            if numbered and m:
+                n += 1
+                self.numbered(n, m.group(2), before=0)
+            else:
+                self.para(_tidy(ln), line=1.5)
+
+    def jurisdiction(self):
+        self.plain_section('JURISDICTION', 'Statement of Jurisdiction', numbered=False)
+
+    def issues(self):
+        self.heading('Issues Raised', 1)
+        for ln in self.secs.get('ISSUES', []):
+            ln = _tidy(ln)
+            m = re.match(r'^(ISSUE\s*[0-9IVX]+\s*[:.\-]?)\s*(.*)$', ln, re.I)
+            if m:
+                self.para(m.group(1).upper().rstrip(' .-') + (':' if not m.group(1).strip().endswith(':') else ''),
+                          bold=True, align='left', before=10, after=4, keep=True)
+                if m.group(2):
+                    self.para(m.group(2), line=1.5)
+            else:
+                self.para(ln, line=1.5)
+
+    def summary(self):
+        self.heading('Summary of Arguments', 1)
+        for ln in self.secs.get('SUMMARY', []):
+            t = _tidy(ln) if not _FN_RE.search(ln) else ln
+            if re.match(r'^ISSUE\s*[0-9IVX]+', t, re.I):
+                self.para(t, bold=True, align='left', before=10, after=4, keep=True)
+            else:
+                self.para(t, line=1.5)
+
+    def arguments(self):
+        self.heading('Arguments Advanced', 1)
+        n = 0
+        for raw in self.secs.get('ARGUMENTS', []):
+            if raw.startswith('###'):
+                self.heading(raw.lstrip('#'), 3, center=False, pbb=False, before=6, after=6)
+            elif raw.startswith('##'):
+                self.heading(raw.lstrip('#'), 3, center=False, pbb=False, before=8, after=6)
+            elif raw.startswith('#'):
+                n = 0
+                self.heading(raw.lstrip('#'), 2, center=False, pbb=False, before=14, after=8)
+            else:
+                m = _NUMBERED_RE.match(raw)
+                sub = re.match(r'^\(?([a-z]|[ivx]{1,4})\)\s+(.*)$', raw)
+                if m:
+                    n += 1
+                    self.numbered(n, m.group(2))
+                elif sub:
+                    p = self.para('', line=1.5, left=0.8, first=-0.4, after=3)
+                    _style_run(p.add_run(f'{sub.group(1)})  '))
+                    self.rich(p, sub.group(2))
+                else:
+                    self.para(raw.replace('**', ''), line=1.5)
+
+    def prayer(self):
+        self.heading('Prayer for Relief', 1)
+        n = 0
+        for ln in self.secs.get('PRAYER', []):
+            m = _NUMBERED_RE.match(ln)
+            if m:
+                n += 1
+                self.numbered(n, m.group(2))
+            else:
+                self.para(_tidy(ln), line=1.5, before=6)
+        sig = [_tidy(x) for x in self.secs.get('SIGNATURE', [])]
+        if sig:
+            self.para('', after=18)
+            t = self.doc.add_table(rows=1, cols=2)
+            left = [s for s in sig if re.match(r'^(PLACE|DATE)\b', s, re.I)]
+            right = [s for s in sig if s not in left]
+            for cell, lines, al in ((t.rows[0].cells[0], left, WD_ALIGN_PARAGRAPH.LEFT),
+                                    (t.rows[0].cells[1], right, WD_ALIGN_PARAGRAPH.RIGHT)):
+                for i, s in enumerate(lines):
+                    cp = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+                    cp.alignment = al
+                    _style_run(cp.add_run(s), bold=(al == WD_ALIGN_PARAGRAPH.RIGHT))
+
+    # ---------- footnotes part + settings
+    def attach_footnotes(self):
+        if not self.footnotes:
+            return
+        rp = '<w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/><w:sz w:val="20"/></w:rPr>'
+        out = [f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:footnotes xmlns:w="{_W_NS}">',
+               '<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>',
+               '<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>']
+        for fid, t in self.footnotes:
+            out.append(f'<w:footnote w:id="{fid}"><w:p><w:pPr><w:jc w:val="both"/></w:pPr>'
+                       f'<w:r><w:rPr><w:vertAlign w:val="superscript"/><w:sz w:val="20"/></w:rPr><w:footnoteRef/></w:r>'
+                       f'<w:r>{rp}<w:t xml:space="preserve"> {_xesc(t)}</w:t></w:r></w:p></w:footnote>')
+        out.append('</w:footnotes>')
+        pkg = self.doc.part.package
+        part = Part(PackURI('/word/footnotes.xml'),
+                    'application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml',
+                    ''.join(out).encode('utf-8'), pkg)
+        self.doc.part.relate_to(part, _RT.FOOTNOTES)
+
+    def update_fields_on_open(self):
+        st = self.doc.settings.element
+        u = OxmlElement('w:updateFields'); u.set(qn('w:val'), 'true')
+        st.append(u)
+
+    def build(self):
+        self.setup()
+        self.build_cover()
+        self.doc.add_section(WD_SECTION.NEW_PAGE)
+        self.first_section_border()
+        self.header_footer()
+        self.heading('Table of Contents', 1, pbb=False)
+        m_toc = self.para('')
+        m_auth = self.para('')
+        self.abbreviations()
+        self.jurisdiction()
+        self.plain_section('FACTS', 'Statement of Facts')
+        self.issues()
+        self.summary()
+        self.arguments()
+        self.prayer()
+        n0 = len(self.headings)
+        self.fill_at(m_auth, self.authorities)
+        auth_h = self.headings[n0:]
+        self.headings = self.headings[:1] + auth_h + self.headings[1:n0]   # authorities follow the TOC entry
+        self.fill_at(m_toc, self.toc_entries)
+        self.attach_footnotes()
+        self.update_fields_on_open()
+        return self.doc
+
+
+def build_moot_docx(doc_type: str, ai_text: str):
+    """Returns the saved .docx path, or None if the text isn't in the tagged memorial format."""
+    secs = parse_moot_text(ai_text)
+    if not secs:
+        return None
+    doc = _MootBuilder(secs).build()
+    os.makedirs(GENERATED_DIR, exist_ok=True)
+    safe = re.sub(r'[^\w\-]', '_', (doc_type or 'Moot_Memorial')[:40]) or 'Moot_Memorial'
+    out = os.path.join(GENERATED_DIR, f'{safe}_{uuid.uuid4().hex[:8]}.docx')
+    doc.save(out)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════[...]
 #  CONVERSATION / DRAFTING WORKFLOW
 # ══════════════════════════════════════════════════════════════════[...]
 #
@@ -869,33 +1361,58 @@ DRAFT_SYSTEM = (
 )
 
 DRAFT_SYSTEM_MOOT = (
-    "You are an expert moot-court coach and legal drafter. Draft a complete, professional "
-    "MEMORIAL (written submission) for a moot court competition, in plain text (no markdown, "
-    "no asterisks, no code fences).\n"
-    "Produce ALL of the following sections, in this order, each on its own ALL-CAPS heading:\n"
-    "1. A cover block naming the court/forum, the parties (with '...PETITIONER'/'...APPELLANT' "
-    "and '...RESPONDENT' style annotations) and 'MEMORANDUM ON BEHALF OF THE <SIDE>'.\n"
-    "2. TABLE OF CONTENTS — the section names only, no page numbers.\n"
-    "3. LIST OF ABBREVIATIONS — a short list of the abbreviations actually used in this memorial.\n"
-    "4. INDEX OF AUTHORITIES — cases, statutes, books and web sources actually relevant to the "
-    "facts and issues given (invent no fake citations; use well-known, plausible authorities for "
-    "the subject matter, or generic statutory references where a specific case isn't certain).\n"
-    "5. STATEMENT OF JURISDICTION — the statutory provision(s) under which this court/forum has "
-    "jurisdiction, and a short formal submission sentence.\n"
-    "6. STATEMENT OF FACTS — a clear, numbered, chronological account of the facts as given by "
-    "the user.\n"
-    "7. STATEMENT OF ISSUES — the legal issues, phrased as 'Whether ...' questions, numbered as "
-    "Issue I, Issue II, etc.\n"
-    "8. SUMMARY OF ARGUMENTS — a short paragraph per issue summarising the position taken.\n"
-    "9. ARGUMENTS ADVANCED — the substantive legal arguments, organised issue-by-issue (I., II., "
-    "...) with sub-points (A., B., ... and 1., 2., ... where useful), applying relevant statutes, "
-    "sections and case law to the facts given.\n"
-    "10. PRAYER FOR RELIEF — the specific relief sought, in the formal 'it is most humbly prayed "
-    "...' style.\n\n"
-    "The memorial must be written squarely from the standpoint of, and in the interest of, the "
-    "side specified below — its framing, emphasis and relief sought should serve that side. Use "
-    "precise, formal legal language in standard moot-memorial drafting conventions. Output ONLY "
-    "the memorial text — no commentary, notes, or explanations outside it."
+    "You are an expert moot-court coach and legal drafter. Draft a complete MEMORIAL in the exact "
+    "structure and style of a competition-winning Indian moot memorial (Table of Contents, Index of "
+    "Authorities, Index of Abbreviations, Statement of Jurisdiction, Statement of Facts, Issues Raised, "
+    "Summary of Arguments, Arguments Advanced, Prayer for Relief).\n"
+    "OUTPUT FORMAT — plain text only (no markdown, no asterisks, no code fences), using these section "
+    "tags, each alone on its own line, in this exact order. A program lays the document out from them, "
+    "so follow the tag syntax precisely and do NOT write a table of contents, page numbers, or headings "
+    "for sections yourself:\n"
+    "@@COVER\n"
+    "TEAM_CODE: <code from the problem, else ______>\n"
+    "COMPETITION: <full competition name, e.g. 4th X NATIONAL FAMILY LAW MOOT COURT COMPETITION, 2023>\n"
+    "COURT: <court/forum before which the matter is argued>\n"
+    "CASE_NO: <e.g. PLAINT NUMBER _______ / 2022  or  Criminal Appeal No. ____ of 2021>\n"
+    "FILED_UNDER: <statute/section line, only if applicable>\n"
+    "SUBJECT: <one-line description of the matter, e.g. IN THE CASE CONCERNING ...>\n"
+    "PARTY1: <FIRST PARTY NAME> | <ROLE e.g. PLAINTIFF / PETITIONER / APPELLANT>\n"
+    "PARTY2: <SECOND PARTY NAME> | <ROLE e.g. DEFENDANT / RESPONDENT>\n"
+    "MEMORIAL_TITLE: MEMORIAL ON BEHALF OF <SIDE IN CAPS, e.g. PLAINTIFF>\n"
+    "@@CASES  — one case per line: 'Party A v Party B, [Year] Vol Reporter Page' (no numbering)\n"
+    "@@STATUTES  — one per line, e.g. The Hindu Marriage Act 1955.\n"
+    "@@BOOKS  — one per line, with author, title, edition, publisher, year\n"
+    "@@WEBSITES  — one URL per line (e.g. https://www.scconline.com/)\n"
+    "@@ABBREVIATIONS  — one per line as: Abbreviation | Full Form  (every abbreviation used in the memorial)\n"
+    "@@JURISDICTION  — paragraph(s) beginning 'The <side> has invoked the jurisdiction of this Hon'ble "
+    "Court under ...'; after each provision cited, put a footnote reproducing that provision.\n"
+    "@@FACTS  — numbered paragraphs '1. ...', '2. ...' stating the facts chronologically, from the "
+    "side's standpoint, using only facts given.\n"
+    "@@ISSUES  — for each issue, two lines: 'ISSUE 1:' then the 'Whether ...?' question on the next line.\n"
+    "@@SUMMARY  — for each issue: a line 'Whether ...?' (the issue, repeated) then one paragraph "
+    "beginning 'It is humbly contended/submitted that ...'; footnotes allowed.\n"
+    "@@ARGUMENTS  — per issue: a line '# 1. THE ISSUE STATED AS A POSITIVE PROPOSITION IN CAPS'; then an "
+    "introductory line 'It is humbly submitted before this Hon'ble Court that ... because:'; then "
+    "sub-points as '(a) ...' lines; then each sub-heading as '## A. SUB-HEADING IN CAPS' followed by "
+    "numbered paragraphs '1. ...', '2. ...' (numbering continues across sub-headings within an issue and "
+    "restarts at 1 for the next issue). Each paragraph argues the law and applies it to the facts. "
+    "Cite authorities in running text as 'In X v Y, the Court held ...'.\n"
+    "@@PRAYER  — an opening line 'Wherefore in light of the issues raised, authorities cited and "
+    "arguments advanced, the <side> humbly prays that this Hon'ble Court may be pleased to adjudge and "
+    "declare that:' then numbered reliefs '1. ...' (one per issue, plus any consequential relief), then "
+    "'And pass any other order which this Hon'ble Court may deem fit in the interest of JUSTICE, EQUITY "
+    "AND GOOD CONSCIENCE.' and 'All of which is humbly prayed.'\n"
+    "@@SIGNATURE  — lines: 'PLACE: <place>', 'DATE: ___/___/____', 'SD/-____________', 'COUNSEL FOR <SIDE>'\n"
+    "FOOTNOTES: put every citation in a footnote written inline as {{fn: Case Name, [Year] Vol Reporter "
+    "Page.}} immediately after the sentence it supports (statute provisions as {{fn: s 9, Code of Civil "
+    "Procedure 1908.}}; facts as {{fn: Moot Proposition ¶ 7.}}). Every case named in a footnote or in the "
+    "text MUST also be listed under @@CASES, and every statute under @@STATUTES. Use ONLY real, well-known "
+    "authorities you are confident exist with correct citations; never invent a case or citation — if "
+    "unsure, argue from the statutory text and principles instead. Where the problem names a fictional "
+    "country/statute (e.g. 'Frisk Penal Code'), use that name consistently.\n"
+    "STYLE: formal, persuasive moot language ('It is humbly submitted', 'It is most respectfully "
+    "contended'); write squarely for the side specified below; address every issue with sub-headings "
+    "and 3-6 substantive numbered paragraphs each. Output ONLY the tagged memorial text — no commentary."
 )
 
 
@@ -1218,7 +1735,7 @@ def build_draft_prompt(conv):
             prompt = (
                 f'Below is a STYLE & STRUCTURE reference drawn from past moot memorials for this '
                 f'side — use it only to match section order, heading conventions, phrasing style '
-                f'and formal tone. Do NOT reuse any facts, party names, case citations, statutes '
+                f'and formal tone. The required @@ tag output format in the system message ALWAYS takes precedence over the reference. Do NOT reuse any facts, party names, case citations, statutes '
                 f'or numbers from it — this is a DIFFERENT case with its own facts and law.\n\n'
                 f'--- STYLE & STRUCTURE REFERENCE ---\n{conv["template_text"][:6000]}\n\n'
                 f'--- THE ACTUAL MOOT PROBLEM / CASE FACTS FOR THIS MEMORIAL ---\n{details}\n\n'
@@ -1278,13 +1795,22 @@ def _run_generation_job(conv, job, system, prompt):
         def on_text(t):
             job["text"] = t
 
+        is_moot = (conv.get("doc_type") == MOOT_MEMORIAL_DOC_TYPE)
         text = ai_generate(prompt, system=system, temperature=0.4,
-                           max_tokens=DRAFT_MAX_TOKENS, on_text=on_text, max_continuations=2)
+                           max_tokens=MOOT_MAX_TOKENS if is_moot else DRAFT_MAX_TOKENS,
+                           on_text=on_text, max_continuations=6 if is_moot else 2)
         text = _clean_draft(text)
         job["text"] = text
 
         try:
-            path = build_ai_legal_docx(conv["doc_type"] or "Legal_Draft", text)
+            path = None
+            if is_moot:
+                try:
+                    path = build_moot_docx(conv["doc_type"], text)
+                except Exception:
+                    traceback.print_exc()
+            if not path:
+                path = build_ai_legal_docx(conv["doc_type"] or "Legal_Draft", text)
         except Exception:
             traceback.print_exc()
             path = ""
